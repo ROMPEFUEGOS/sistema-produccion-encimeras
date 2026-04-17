@@ -1,0 +1,28 @@
+# Datos de clientes - NO subir
+1-DISEÑOS MAQUINA/
+Cocimoble2025/
+Cocimoble2026/
+ACyC*/
+Fotos Materiales/
+Fotos Materiales (2)/
+2026-04-15CatalogoMateriales.xlsx
+
+# DXFs y PDFs en raíz (trabajos individuales)
+*.dxf
+*.pdf
+*.bak
+*.dxf~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporales
+*.log
+*.tmp
+*.zip
+test_*.pdf
+
+# Credenciales - NUNCA subir
+.env

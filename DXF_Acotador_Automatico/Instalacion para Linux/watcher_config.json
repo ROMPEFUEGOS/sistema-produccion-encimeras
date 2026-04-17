@@ -1,0 +1,21 @@
+{
+  "watch_folder": "/ruta/a/TRABAJOS_DXF",
+  "dimensioner_script": "dxf_auto_dim_v1.3.py",
+  "blacklist": [
+    "Archivo",
+    "ARCHIVO",
+    "archivo",
+    "archive",
+    "OLD",
+    "old",
+    "BORRADOR",
+    "borrador",
+    "OBSOLETO",
+    "obsoleto"
+  ],
+  "debounce_seconds": 5,
+  "scan_on_start": true,
+  "log_file": "dxf_watcher.log",
+  "log_level": "INFO",
+  "python_executable": ""
+}
