@@ -34,12 +34,17 @@ LAYER_CORTE     = "0"          # corte disco normal
 LAYER_FRESA     = "0-CON"      # fresado (curvas grandes)
 LAYER_TALADRO   = "1006"       # taladros (enchufes, grifos)
 LAYER_GRUPO     = "1002"       # pieza indivisible
-LAYER_GUIA      = "1007"       # guía visual
+LAYER_GUIA      = "1007"       # guía visual (pulido, marcas no mecanizadas)
 
 LT_NORMAL  = "CONTINUOUS"   # corte normal
 LT_TAB     = "DASHED"       # pausa disco (TAB)
-LT_INGLETE = "HIDDEN"       # dirección herramienta / ingletes
 LT_UTL     = "DOTTED"       # último pase lento
+
+# Inglete por defecto: 45.5° (holgura estándar del negocio; ver feedback_acabados_aristas)
+ANGULO_INGLETE_DEFAULT = 45.5
+
+# Color cian para layer 1007 (pulido / guía visual)
+COLOR_GUIA = 4
 
 R_ENCHUFE  = 35.0   # radio enchufe = 70mm diámetro (broca 7cm)
 R_GRIFO    = 17.5   # radio grifo = 35mm diámetro
@@ -52,7 +57,7 @@ SEP_PIEZAS = 20.0   # separación entre piezas en el DXF
 def _setup_linetypes(doc):
     """Asegura que los tipos de línea necesarios existen en el documento."""
     existing = [lt.dxf.name for lt in doc.linetypes]
-    for lt in [LT_TAB, LT_INGLETE, LT_UTL]:
+    for lt in [LT_TAB, LT_UTL]:
         if lt not in existing:
             doc.linetypes.new(lt, dxfattribs={"description": lt})
 
@@ -61,15 +66,41 @@ def _setup_layers(doc):
     """Crea las capas necesarias si no existen."""
     existing = [l.dxf.name for l in doc.layers]
     specs = [
-        (LAYER_CORTE,   7,  LT_NORMAL),   # blanco
-        (LAYER_FRESA,   3,  LT_NORMAL),   # verde
-        (LAYER_TALADRO, 5,  LT_NORMAL),   # azul
-        (LAYER_GRUPO,   1,  LT_NORMAL),   # rojo
-        (LAYER_GUIA,    9,  LT_NORMAL),   # gris
+        (LAYER_CORTE,   7,          LT_NORMAL),   # blanco
+        (LAYER_FRESA,   3,          LT_NORMAL),   # verde
+        (LAYER_TALADRO, 5,          LT_NORMAL),   # azul
+        (LAYER_GRUPO,   1,          LT_NORMAL),   # rojo
+        (LAYER_GUIA,    COLOR_GUIA, LT_NORMAL),   # cian — guía pulido
     ]
     for name, color, lt in specs:
         if name not in existing:
             doc.layers.new(name, dxfattribs={"color": color, "linetype": lt})
+
+
+# ── Capas dinámicas para cortes inclinados (ingletes / biseles) ───────────────
+
+def _format_angulo(angulo: float) -> str:
+    """Formatea ángulo para nombre de capa CAM: 45.5 → '45_5', -45.5 → '-45_5'."""
+    a = float(angulo)
+    signo = "-" if a < 0 else ""
+    ent, dec = divmod(abs(a), 1)
+    if dec < 0.001:
+        return f"{signo}{int(ent)}"
+    dec_str = f"{dec:.2f}".rstrip("0").rstrip(".")[2:]  # "0.5" → "5", "0.25" → "25"
+    return f"{signo}{int(ent)}_{dec_str}"
+
+
+def _layer_inclinacion(doc, angulo: float) -> str:
+    """
+    Devuelve el nombre de la capa `1000INC{angulo}`. La crea si no existe.
+    El signo indica la dirección del bisel.
+    """
+    nombre = f"1000INC{_format_angulo(angulo)}"
+    existing = [l.dxf.name for l in doc.layers]
+    if nombre not in existing:
+        # Color 2 (amarillo) para que destaque en AutoCAD respecto a los cortes normales
+        doc.layers.new(nombre, dxfattribs={"color": 2, "linetype": LT_NORMAL})
+    return nombre
 
 
 def _line(msp, x0, y0, x1, y1, layer=LAYER_CORTE, lt=LT_NORMAL):
@@ -86,29 +117,92 @@ def _circle(msp, cx, cy, r, layer=LAYER_TALADRO):
 def _rect(msp, x, y, w, h, layer=LAYER_CORTE, lt=LT_NORMAL,
           descuadro_izq=0.0, descuadro_der=0.0):
     """
-    Dibuja un rectángulo como 4 LINE separadas.
-    descuadro_izq / descuadro_der: desplazamiento en mm del lado izquierdo/derecho
-    (positivo = la esquina de arriba se mueve hacia la derecha = pared empuja).
-    El descuadro se aplica sólo a las esquinas superiores.
-
-    Coordenadas:
-      inf-izq = (x,           y)
-      inf-der = (x+w,         y)
-      sup-der = (x+w+d_der,   y+h)
-      sup-izq = (x+d_izq,     y+h)
+    Dibuja un rectángulo como 4 LINE separadas en la misma capa/linetype.
+    Usado para huecos (placa, fregadero) y piezas sin acabados especiales.
     """
     d_izq = float(descuadro_izq or 0)
     d_der = float(descuadro_der or 0)
 
-    p0 = (x,          y)       # inf-izq
-    p1 = (x + w,      y)       # inf-der
-    p2 = (x + w + d_der, y + h)  # sup-der
-    p3 = (x + d_izq,  y + h)  # sup-izq
+    p0 = (x,             y)
+    p1 = (x + w,         y)
+    p2 = (x + w + d_der, y + h)
+    p3 = (x + d_izq,     y + h)
 
-    _line(msp, p0[0], p0[1], p1[0], p1[1], layer, lt)  # frente (inf)
-    _line(msp, p1[0], p1[1], p2[0], p2[1], layer, lt)  # lado derecho
-    _line(msp, p2[0], p2[1], p3[0], p3[1], layer, lt)  # pared (sup)
-    _line(msp, p3[0], p3[1], p0[0], p0[1], layer, lt)  # lado izquierdo
+    _line(msp, p0[0], p0[1], p1[0], p1[1], layer, lt)
+    _line(msp, p1[0], p1[1], p2[0], p2[1], layer, lt)
+    _line(msp, p2[0], p2[1], p3[0], p3[1], layer, lt)
+    _line(msp, p3[0], p3[1], p0[0], p0[1], layer, lt)
+
+
+def _rect_con_acabados(msp, x, y, w, h, acabados: dict = None,
+                       descuadro_izq=0.0, descuadro_der=0.0):
+    """
+    Contorno de pieza con acabado independiente por arista.
+
+    Cada arista se dibuja en la capa CAM que corresponde:
+      - inglete/bisel → layer 1000INC{angulo} (ej. 1000INC45_5)
+      - pulido        → layer 0 + línea paralela en 1007 como marcador visual
+      - null/None     → layer 0 (corte normal)
+
+    acabados: dict con claves 'frente', 'fondo', 'cabeza_izq', 'cabeza_der'.
+              Cada valor: {'tipo': 'inglete'|'bisel'|'pulido'|None,
+                           'angulo': float|None, 'profundidad_mm': float|None}
+
+    Descuadros: desplazamiento lateral de las esquinas superiores (pared que empuja).
+    """
+    doc      = msp.doc
+    acabados = acabados or {}
+    d_izq    = float(descuadro_izq or 0)
+    d_der    = float(descuadro_der or 0)
+
+    p0 = (x,             y)            # inf-izq
+    p1 = (x + w,         y)            # inf-der
+    p2 = (x + w + d_der, y + h)        # sup-der
+    p3 = (x + d_izq,     y + h)        # sup-izq
+
+    # Orden CCW: el interior queda a la izquierda del avance
+    aristas = [
+        ("frente",     p0, p1),
+        ("cabeza_der", p1, p2),
+        ("fondo",      p2, p3),
+        ("cabeza_izq", p3, p0),
+    ]
+
+    for nombre, a, b in aristas:
+        acab  = acabados.get(nombre) or {}
+        tipo  = (acab.get("tipo") or "").strip().lower() if acab.get("tipo") else None
+        angulo = acab.get("angulo")
+
+        if tipo in ("inglete", "bisel"):
+            if angulo is None:
+                angulo = ANGULO_INGLETE_DEFAULT
+            layer = _layer_inclinacion(doc, angulo)
+            _line(msp, a[0], a[1], b[0], b[1], layer=layer)
+        elif tipo == "pulido":
+            _line(msp, a[0], a[1], b[0], b[1], layer=LAYER_CORTE)
+            _marcar_pulido(msp, a, b)
+        else:
+            _line(msp, a[0], a[1], b[0], b[1], layer=LAYER_CORTE)
+
+
+def _marcar_pulido(msp, a, b, offset=15.0):
+    """
+    Dibuja una línea paralela al borde en layer 1007 (guía visual, no mecaniza)
+    a {offset}mm hacia el interior de la pieza. Sirve como marcador del pulido
+    para el operario del taller (se ve en el DXF y en el PDF acotado).
+
+    Para polígonos en sentido antihorario (el usado por _rect_con_acabados),
+    el interior queda a la izquierda del vector de avance: normal = (-dy, dx).
+    """
+    import math
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(dx, dy)
+    if length < 1:
+        return
+    nx, ny = -dy / length, dx / length   # normal hacia el interior
+    ax, ay = a[0] + nx * offset, a[1] + ny * offset
+    bx, by = b[0] + nx * offset, b[1] + ny * offset
+    _line(msp, ax, ay, bx, by, layer=LAYER_GUIA)
 
 
 def _hueco_rect(msp, x, y, w, h, layer=LAYER_CORTE, lt=LT_TAB):
@@ -147,53 +241,132 @@ class Cursor:
         return pos
 
 
+def _acabados_de_pieza(pieza: dict) -> dict:
+    """
+    Devuelve los acabados_aristas en formato nuevo, convirtiendo la lista
+    legacy 'ingletes' si existe y 'acabados_aristas' no está presente.
+    """
+    acab = pieza.get("acabados_aristas")
+    if isinstance(acab, dict) and acab:
+        return acab
+
+    # Compat: 'ingletes' es una lista de nombres de arista con inglete 45°
+    ingletes = pieza.get("ingletes") or []
+    if ingletes:
+        return {
+            nombre: {"tipo": "inglete", "angulo": ANGULO_INGLETE_DEFAULT,
+                     "profundidad_mm": None}
+            for nombre in ingletes
+        }
+    return {}
+
+
+def validar_pieza(pieza: dict) -> list[str]:
+    """
+    Devuelve lista de strings de problemas bloqueantes para dibujar la pieza.
+    Vacía = pieza dibujable con certeza (producción).
+    Sin defaults: si falta una dimensión crítica, es un problema.
+    """
+    problemas = []
+    tipo = (pieza.get("tipo") or "").lower()
+    largo = pieza.get("largo_mm")
+    ancho = pieza.get("ancho_mm")
+    alto  = pieza.get("alto_mm")
+
+    if largo in (None, 0):
+        problemas.append("largo_mm")
+
+    if tipo in ("encimera", "isla", "cascada"):
+        if ancho in (None, 0):
+            problemas.append("ancho_mm (fondo de la encimera)")
+    elif tipo in ("chapeado", "frontal", "pilastra", "costado"):
+        # Necesita alto o ancho_mm como altura vertical
+        if (alto in (None, 0)) and (ancho in (None, 0)):
+            problemas.append("alto_mm (altura del chapeado)")
+    elif tipo in ("copete", "rodapie", "zocalo", "paso", "tabica"):
+        # Tira fina: necesita altura
+        if (alto in (None, 0)) and (ancho in (None, 0)):
+            problemas.append("alto_mm (altura de la tira)")
+    else:
+        if (ancho in (None, 0)) and (alto in (None, 0)):
+            problemas.append("ancho_mm o alto_mm")
+
+    # Huecos: cada uno necesita sus medidas y ubicación completas
+    for i, h in enumerate(pieza.get("huecos") or []):
+        if not isinstance(h, dict):
+            problemas.append(f"hueco[{i}] formato inválido")
+            continue
+        tipo_h = (h.get("tipo") or "").lower()
+        if tipo_h in ("placa", "fregadero"):
+            if not h.get("largo_mm"):  problemas.append(f"hueco[{i}] {tipo_h}: largo_mm")
+            if not h.get("ancho_mm"):  problemas.append(f"hueco[{i}] {tipo_h}: ancho_mm")
+            if h.get("distancia_frente_mm") in (None,):
+                problemas.append(f"hueco[{i}] {tipo_h}: distancia_frente_mm")
+            pos = (h.get("posicion") or "").lower()
+            if pos in ("izquierda", "derecha") and h.get("distancia_lado_mm") in (None,):
+                problemas.append(f"hueco[{i}] {tipo_h}: distancia_lado_mm ({pos})")
+            if not pos:
+                problemas.append(f"hueco[{i}] {tipo_h}: posicion")
+        elif tipo_h in ("enchufe", "grifo"):
+            # El Ø es una constante (broca), pero necesitamos dónde ponerlo
+            if h.get("distancia_frente_mm") in (None,):
+                problemas.append(f"hueco[{i}] {tipo_h}: distancia_frente_mm")
+            pos = (h.get("posicion") or "").lower()
+            if pos in ("izquierda", "derecha") and h.get("distancia_lado_mm") in (None,):
+                problemas.append(f"hueco[{i}] {tipo_h}: distancia_lado_mm")
+    return problemas
+
+
+def _dims_para_cursor(pieza: dict) -> tuple[float, float]:
+    """(w, h) físicos de la pieza para avanzar el cursor en el DXF."""
+    tipo = (pieza.get("tipo") or "").lower()
+    largo = float(pieza.get("largo_mm") or 0)
+    if tipo in ("encimera", "isla", "cascada"):
+        h = float(pieza.get("ancho_mm") or pieza.get("alto_mm") or 0)
+    else:
+        h = float(pieza.get("alto_mm") or pieza.get("ancho_mm") or 0)
+    return largo, h
+
+
 def _dibujar_encimera(msp, pieza: dict, x: float, y: float):
-    """
-    Encimera simple (rectangular o con descuadro).
-    El frente es el lado inferior (y mínimo). Las paredes están arriba.
-    """
-    w = float(pieza.get("largo_mm") or pieza.get("ancho_mm") or 0)
-    h = float(pieza.get("ancho_mm") or pieza.get("alto_mm") or 0)
-    # Para encimeras: largo = ancho de la pieza (de izq a der)
-    #                 ancho = fondo (profundidad, de frente a pared)
-    # Si solo hay largo_mm sin ancho_mm usamos 620mm como fondo por defecto
-    if not h:
-        h = 620.0
+    """Encimera (rectangular o con descuadro). Frente = lado inferior."""
+    w = float(pieza["largo_mm"])
+    h = float(pieza.get("ancho_mm") or pieza.get("alto_mm"))
 
     d_izq = float(pieza.get("descuadro_izq_mm") or 0)
     d_der = float(pieza.get("descuadro_der_mm") or 0)
 
-    _rect(msp, x, y, w, h, descuadro_izq=d_izq, descuadro_der=d_der)
-
-    # Huecos dentro de la encimera
+    _rect_con_acabados(
+        msp, x, y, w, h,
+        acabados=_acabados_de_pieza(pieza),
+        descuadro_izq=d_izq, descuadro_der=d_der,
+    )
     _dibujar_huecos(msp, pieza.get("huecos", []), x, y, w, h, pieza)
-
     return w, h
 
 
 def _dibujar_chapeado(msp, pieza: dict, x: float, y: float):
-    """
-    Chapeado / frontal (panel vertical). largo × alto.
-    """
-    w = float(pieza.get("largo_mm") or 0)
-    h = float(pieza.get("alto_mm") or pieza.get("ancho_mm") or 0)
+    """Chapeado / frontal (panel vertical). largo × alto."""
+    w = float(pieza["largo_mm"])
+    h = float(pieza.get("alto_mm") or pieza.get("ancho_mm"))
 
     d_izq = float(pieza.get("descuadro_izq_mm") or 0)
     d_der = float(pieza.get("descuadro_der_mm") or 0)
 
-    _rect(msp, x, y, w, h, descuadro_izq=d_izq, descuadro_der=d_der)
-
-    # Huecos (enchufes principalmente)
+    _rect_con_acabados(
+        msp, x, y, w, h,
+        acabados=_acabados_de_pieza(pieza),
+        descuadro_izq=d_izq, descuadro_der=d_der,
+    )
     _dibujar_huecos(msp, pieza.get("huecos", []), x, y, w, h, pieza)
-
     return w, h
 
 
 def _dibujar_tira(msp, pieza: dict, x: float, y: float):
     """Copete, rodapié — largas y estrechas."""
-    w = float(pieza.get("largo_mm") or 0)
-    h = float(pieza.get("alto_mm") or pieza.get("ancho_mm") or 50)
-    _rect(msp, x, y, w, h)
+    w = float(pieza["largo_mm"])
+    h = float(pieza.get("alto_mm") or pieza.get("ancho_mm"))
+    _rect_con_acabados(msp, x, y, w, h, acabados=_acabados_de_pieza(pieza))
     return w, h
 
 
@@ -201,67 +374,66 @@ def _dibujar_huecos(msp, huecos: list, base_x, base_y, pieza_w, pieza_h, pieza: 
     """
     Dibuja huecos dentro de una pieza (placa, fregadero, grifo, enchufe).
     base_x, base_y = esquina inferior izquierda de la pieza.
+
+    NO usa defaults: si faltan medidas/posición críticas, el hueco se omite con
+    warning. La validación previa en validar_pieza() ya debería haberlo filtrado.
     """
-    for hueco in huecos:
-        tipo = hueco.get("tipo", "")
-        hw   = float(hueco.get("largo_mm") or 0)
-        hh   = float(hueco.get("ancho_mm") or hueco.get("alto_mm") or 0)
-        pos  = (hueco.get("posicion") or "centro").lower()
-        dist_frente = float(hueco.get("distancia_frente_mm") or 70)
+    for idx, hueco in enumerate(huecos):
+        tipo = (hueco.get("tipo") or "").lower()
+        hw   = hueco.get("largo_mm")
+        hh   = hueco.get("ancho_mm") or hueco.get("alto_mm")
+        pos  = (hueco.get("posicion") or "").lower()
+        dist_frente = hueco.get("distancia_frente_mm")
+        dist_lado   = hueco.get("distancia_lado_mm")
 
-        if tipo == "placa":
-            if not hw: hw = 560
-            if not hh: hh = 490
-            # Centrar horizontalmente si posición centro
+        if tipo in ("placa", "fregadero"):
+            if not hw or not hh or dist_frente is None or not pos:
+                print(f"    ⚠ Hueco {tipo} #{idx} omitido: faltan medidas/posición")
+                continue
+            hw = float(hw); hh = float(hh)
             if "izq" in pos:
-                hx = base_x + 100
+                if dist_lado is None:
+                    print(f"    ⚠ Hueco {tipo} #{idx} 'izquierda' omitido: falta distancia_lado_mm"); continue
+                hx = base_x + float(dist_lado)
             elif "der" in pos:
-                hx = base_x + pieza_w - hw - 100
-            else:
+                if dist_lado is None:
+                    print(f"    ⚠ Hueco {tipo} #{idx} 'derecha' omitido: falta distancia_lado_mm"); continue
+                hx = base_x + pieza_w - hw - float(dist_lado)
+            elif "centro" in pos:
                 hx = base_x + (pieza_w - hw) / 2
-            hy = base_y + dist_frente
-            _hueco_rect(msp, hx, hy, hw, hh)
+            else:
+                print(f"    ⚠ Hueco {tipo} #{idx} omitido: posicion='{pos}' desconocida"); continue
+            hy = base_y + float(dist_frente)
 
-        elif tipo == "fregadero":
-            if not hw: hw = 490
-            if not hh: hh = 400
-            if "izq" in pos:
-                hx = base_x + 100
-            elif "der" in pos:
-                hx = base_x + pieza_w - hw - 100
-            else:
-                hx = base_x + (pieza_w - hw) / 2
-            hy = base_y + dist_frente
-            # Si el fregadero es "sobre encimera" es un hueco rectangular estándar
-            subtipo = (hueco.get("subtipo") or "").lower()
-            if "curva" in (hueco.get("notas") or "").lower():
-                _hueco_fregadero_con_curvas(msp, hx + hw/2, hy + hh/2, hw, hh)
-            else:
+            if tipo == "placa":
                 _hueco_rect(msp, hx, hy, hw, hh)
+            else:  # fregadero
+                if "curva" in (hueco.get("notas") or "").lower():
+                    _hueco_fregadero_con_curvas(msp, hx + hw/2, hy + hh/2, hw, hh)
+                else:
+                    _hueco_rect(msp, hx, hy, hw, hh)
 
-        elif tipo == "grifo":
-            # Agujero 35mm diámetro, detrás del fregadero
-            # Posición aproximada: a la derecha del fregadero o según nota
-            hx = base_x + pieza_w * 0.6
-            hy = base_y + dist_frente + 50
-            _circle(msp, hx, hy, R_GRIFO)
-
-        elif tipo == "enchufe":
-            # Agujero 70mm diámetro en capa 1006
+        elif tipo in ("grifo", "enchufe"):
+            radio = R_GRIFO if tipo == "grifo" else R_ENCHUFE
+            if dist_frente is None:
+                print(f"    ⚠ Hueco {tipo} #{idx} omitido: falta distancia_frente_mm"); continue
             if "izq" in pos:
-                hx = base_x + 150
+                if dist_lado is None:
+                    print(f"    ⚠ Hueco {tipo} #{idx} 'izquierda' omitido: falta distancia_lado_mm"); continue
+                hx = base_x + float(dist_lado)
             elif "der" in pos:
-                hx = base_x + pieza_w - 150
-            else:
+                if dist_lado is None:
+                    print(f"    ⚠ Hueco {tipo} #{idx} 'derecha' omitido: falta distancia_lado_mm"); continue
+                hx = base_x + pieza_w - float(dist_lado)
+            elif "centro" in pos:
                 hx = base_x + pieza_w / 2
-            # En chapeado: a media altura; en encimera: según distancia_frente
-            if pieza.get("tipo") in ("chapeado",):
-                hy = base_y + pieza_h / 2
             else:
-                hy = base_y + dist_frente + 50
-            cantidad = int(hueco.get("cantidad") or 1)
-            for i in range(cantidad):
-                _circle(msp, hx + i * 120, hy, R_ENCHUFE, layer=LAYER_TALADRO)
+                print(f"    ⚠ Hueco {tipo} #{idx} omitido: posicion='{pos}' desconocida"); continue
+            hy = base_y + float(dist_frente)
+            _circle(msp, hx, hy, radio, layer=LAYER_TALADRO)
+
+        else:
+            print(f"    ⚠ Hueco tipo='{tipo}' no reconocido (pieza {pieza.get('tipo')})")
 
 
 # ── Generador principal ────────────────────────────────────────────────────────
@@ -287,28 +459,41 @@ def generar_dxf(medidas: dict, salida: Path,
     piezas = medidas.get("piezas", [])
     cursor = Cursor(x0=0, y0=0, sep=separacion)
 
-    for pieza in piezas:
-        tipo = (pieza.get("tipo") or "encimera").lower()
-        x, y = cursor.siguiente(
-            float(pieza.get("largo_mm") or pieza.get("ancho_mm") or 600),
-            float(pieza.get("alto_mm") or pieza.get("ancho_mm") or 600),
-        )
+    dibujadas = 0
+    omitidas  = []
+
+    for i, pieza in enumerate(piezas):
+        problemas = validar_pieza(pieza)
+        if problemas:
+            omitidas.append({"index": i + 1, "tipo": pieza.get("tipo"),
+                              "notas": pieza.get("notas",""), "faltan": problemas})
+            print(f"  ⚠ Pieza #{i+1} ({pieza.get('tipo')}) OMITIDA — faltan: {', '.join(problemas)}")
+            continue
+
+        tipo = (pieza.get("tipo") or "").lower()
+        w_p, h_p = _dims_para_cursor(pieza)
+        x, y = cursor.siguiente(w_p, h_p)
 
         if tipo in ("encimera", "isla"):
-            w, h = _dibujar_encimera(msp, pieza, x, y)
+            _dibujar_encimera(msp, pieza, x, y)
         elif tipo in ("chapeado", "frontal", "pilastra", "costado"):
-            w, h = _dibujar_chapeado(msp, pieza, x, y)
+            _dibujar_chapeado(msp, pieza, x, y)
         elif tipo in ("copete", "rodapie", "zocalo", "paso", "tabica"):
-            w, h = _dibujar_tira(msp, pieza, x, y)
+            _dibujar_tira(msp, pieza, x, y)
         else:
-            # Genérico
-            w = float(pieza.get("largo_mm") or 500)
-            h = float(pieza.get("alto_mm") or pieza.get("ancho_mm") or 100)
+            # Genérico: solo si el usuario ha especificado ambas dimensiones
+            w = float(pieza["largo_mm"])
+            h = float(pieza.get("alto_mm") or pieza.get("ancho_mm"))
             _rect(msp, x, y, w, h)
+        dibujadas += 1
 
     salida.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(str(salida))
-    print(f"✓ DXF guardado: {salida} ({len(piezas)} piezas)")
+    print(f"✓ DXF guardado: {salida} ({dibujadas}/{len(piezas)} piezas dibujadas)")
+    if omitidas:
+        print(f"  ⚠ {len(omitidas)} pieza(s) omitidas por dimensiones incompletas:")
+        for o in omitidas:
+            print(f"     #{o['index']} {o['tipo']}: {', '.join(o['faltan'])}")
     return salida
 
 

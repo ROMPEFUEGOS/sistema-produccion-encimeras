@@ -1140,10 +1140,137 @@ def draw_corner_angle(ax, corner, prev_pt, next_pt, gap, color=COL_ANGLE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ACABADOS DE ARISTAS  (v1.4)
+#  Detección de líneas en capas CAM especiales (1000INC*, 1007) y generación
+#  de etiquetas "INGLETE {ang}°", "BISEL {ang}°", "PULIDO" sobre las aristas.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Offset usado en dxf_produccion._marcar_pulido para la línea paralela en 1007.
+PULIDO_OFFSET_MM = 15.0
+
+
+def extract_edge_markers(entities):
+    """
+    Extrae LINEs en capas CAM especiales para anotar acabados en el PDF.
+
+    Retorna lista de dicts con:
+      layer, kind ('inglete'|'bisel'|'pulido'), angle (float|None),
+      start (x,y), end (x,y).
+
+    Convenciones:
+      * Layer 1000INC{ang} → corte inclinado del disco. Angle en [40,50] → 'inglete';
+        otros → 'bisel'. El '_' del nombre se interpreta como separador decimal.
+      * Layer 1007 → línea paralela de guía visual: marca arista pulida.
+    """
+    markers = []
+    for e in entities:
+        if e.get('type') != 'LINE':
+            continue
+        layer = e.get('layer', '0')
+        s = (e.get('x1', 0), e.get('y1', 0))
+        t = (e.get('x2', 0), e.get('y2', 0))
+
+        if layer.startswith('1000INC'):
+            suf = layer[len('1000INC'):].replace('_', '.')
+            try:
+                angle = float(suf)
+            except ValueError:
+                continue
+            kind = 'inglete' if 40.0 <= abs(angle) <= 50.0 else 'bisel'
+            markers.append({'layer': layer, 'kind': kind, 'angle': angle,
+                            'start': s, 'end': t})
+        elif layer == '1007':
+            markers.append({'layer': layer, 'kind': 'pulido', 'angle': None,
+                            'start': s, 'end': t})
+    return markers
+
+
+def _match_marker_to_edge(marker, piece_outer, tol_endpoint=2.0,
+                          tol_offset=5.0, tol_parallel=0.95):
+    """
+    Devuelve (edge_start, edge_end) del outer de la pieza que corresponde al
+    marker, o None si no hay match.
+
+    Regla de matching:
+      * 'inglete'/'bisel': mismos extremos (orden indiferente) dentro de tol_endpoint.
+      * 'pulido': línea paralela a una arista a distancia ≈ PULIDO_OFFSET_MM
+        (dentro de tol_offset) con proyección superpuesta al segmento.
+    """
+    n = len(piece_outer)
+    s, e = marker['start'], marker['end']
+
+    if marker['kind'] in ('inglete', 'bisel'):
+        for i in range(n):
+            a = piece_outer[i]
+            b = piece_outer[(i + 1) % n]
+            same = math.dist(a, s) < tol_endpoint and math.dist(b, e) < tol_endpoint
+            rev  = math.dist(a, e) < tol_endpoint and math.dist(b, s) < tol_endpoint
+            if same or rev:
+                return (a, b)
+        return None
+
+    if marker['kind'] == 'pulido':
+        mvx, mvy = e[0] - s[0], e[1] - s[1]
+        mlen = math.hypot(mvx, mvy)
+        if mlen < 1:
+            return None
+        mvx /= mlen; mvy /= mlen
+        mid = ((s[0] + e[0]) / 2, (s[1] + e[1]) / 2)
+
+        best = None; best_d = float('inf')
+        for i in range(n):
+            a = piece_outer[i]
+            b = piece_outer[(i + 1) % n]
+            dx = b[0] - a[0]; dy = b[1] - a[1]
+            elen = math.hypot(dx, dy)
+            if elen < 1: continue
+            evx, evy = dx / elen, dy / elen
+            # Paralelismo (|dot| cerca de 1)
+            dot = abs(evx * mvx + evy * mvy)
+            if dot < tol_parallel:
+                continue
+            # Distancia perpendicular desde mid del marker a la línea del edge
+            nx, ny = -evy, evx
+            perp = abs((mid[0] - a[0]) * nx + (mid[1] - a[1]) * ny)
+            if abs(perp - PULIDO_OFFSET_MM) > tol_offset:
+                continue
+            # Proyección sobre la arista (debe caer dentro del segmento)
+            tproj = (mid[0] - a[0]) * evx + (mid[1] - a[1]) * evy
+            if tproj < -tol_offset or tproj > elen + tol_offset:
+                continue
+            d = abs(perp - PULIDO_OFFSET_MM)
+            if d < best_d:
+                best_d = d; best = (a, b)
+        return best
+
+    return None
+
+
+def draw_edge_finishes(ax, piece, markers, gap):
+    """Dibuja las etiquetas de acabado sobre las aristas correspondientes."""
+    if not markers:
+        return
+    COLORS = {'inglete': '#C62828', 'bisel': '#6A1B9A', 'pulido': '#00838F'}
+    for mk in markers:
+        edge = _match_marker_to_edge(mk, piece['outer'])
+        if edge is None:
+            continue
+        a, b = edge
+        if mk['kind'] == 'inglete':
+            label = f"INGLETE {mk['angle']:.1f}°"
+        elif mk['kind'] == 'bisel':
+            label = f"BISEL {abs(mk['angle']):.1f}°"
+        else:
+            label = "PULIDO"
+        draw_edge_label(ax, a, b, label, color=COLORS[mk['kind']], fs=7.2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  RENDER — PÁGINA DE PIEZA  (v1.3)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm'):
+def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm',
+                      edge_markers=None):
     fig, ax = plt.subplots(figsize=(11.69, 8.27))  # A4 apaisado
 
     gap = compute_dim_gap(m['width'], m['height'])
@@ -1210,6 +1337,9 @@ def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm'
     # ── COTAS PRINCIPALES: cadenas horizontales y verticales ──────────────────
     draw_chain_dims_h(ax, chain_ref_pts, m['miny'], gap, units, COL_DIM)
     draw_chain_dims_v(ax, chain_ref_pts, m['maxx'], gap, units, COL_DIM)
+
+    # ── ACABADOS CAM (inglete / bisel / pulido) ──────────────────────────────
+    draw_edge_finishes(ax, piece, edge_markers, gap)
 
     # ── ARISTAS DIAGONALES: longitud + ángulo ─────────────────────────────────
     for e in edges:
@@ -1309,6 +1439,17 @@ def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm'
         legend_items.append(mpatches.Patch(color=COL_DIST,  label='Dist. a bordes (4 lados)'))
     if m['descuadro']:
         legend_items.append(mpatches.Patch(color=COL_DSQR,  label='Descuadros'))
+    # Acabados presentes en esta pieza
+    kinds_presentes = set()
+    for mk in (edge_markers or []):
+        if _match_marker_to_edge(mk, piece['outer']) is not None:
+            kinds_presentes.add(mk['kind'])
+    if 'inglete' in kinds_presentes:
+        legend_items.append(mpatches.Patch(color='#C62828', label='Inglete (CAM disco inclinado)'))
+    if 'bisel'   in kinds_presentes:
+        legend_items.append(mpatches.Patch(color='#6A1B9A', label='Bisel (CAM disco inclinado)'))
+    if 'pulido'  in kinds_presentes:
+        legend_items.append(mpatches.Patch(color='#00838F', label='Pulido (post-proceso manual)'))
     ax.legend(handles=legend_items, loc='lower right',
               fontsize=6.0, framealpha=0.92)
 
@@ -1542,6 +1683,22 @@ def main():
     polygons = all_polygons(entities, tol)
     print(f"  Polígonos cerrados: {len(polygons)}")
 
+    # Marcadores de acabados CAM (inglete/bisel/pulido). Se snapean igual que
+    # los polígonos para que los extremos coincidan durante el matching.
+    edge_markers_raw = extract_edge_markers(entities)
+    edge_markers = [
+        {**mk,
+         'start': snap(mk['start'][0], mk['start'][1], tol),
+         'end':   snap(mk['end'][0],   mk['end'][1],   tol)}
+        for mk in edge_markers_raw
+    ]
+    if edge_markers:
+        kinds_count = {}
+        for mk in edge_markers:
+            kinds_count[mk['kind']] = kinds_count.get(mk['kind'], 0) + 1
+        resumen = ', '.join(f'{k}={v}' for k, v in sorted(kinds_count.items()))
+        print(f"  Acabados CAM detectados: {len(edge_markers)} ({resumen})")
+
     if not polygons:
         print(f"\n✗ No se detectaron polígonos. Prueba: -t {tol*3:.1f}")
         sys.exit(1)
@@ -1586,7 +1743,8 @@ def main():
                     pd['piece'], pd['measurements'], pdf,
                     Path(dxf_in).name,
                     page_num=i+2, total_pages=total_pgs,
-                    units=units)
+                    units=units,
+                    edge_markers=edge_markers)
                 print(f"  ✓ Pieza #{pd['piece']['index']}")
     except Exception as ex:
         print(f"\n✗ Error generando PDF: {ex}")

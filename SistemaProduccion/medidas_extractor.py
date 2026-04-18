@@ -54,13 +54,14 @@ FORMAS:
 
 HUECOS:
 • Placa de cocina: rectángulo marcado dentro de la encimera con sus medidas.
-  Si no aparecen medidas, el estándar es 560×490mm.
-  Las líneas del hueco de placa se dibujan con guiones (línea de corte = TAB).
+  ⚠ Si no aparecen medidas en la nota, deja largo_mm/ancho_mm en null y añade
+  "FALTA: medidas placa" en notas — NO inventes 560×490 (esto es producción).
 • Fregadero: rectángulo con etiqueta "freg", "fregadero", "B/E" (bajo encimera)
-  o "Sobre" (sobre encimera). Si no hay medidas, estándar ~490×400mm.
-• Grifo: círculo pequeño cerca del fregadero. Hueco de 35mm diámetro.
-• Enchufe: círculo marcado con "E" o "enchuf" en el chapeado o encimera.
-  Hueco de 70mm diámetro (broca 7cm), capa 1006.
+  o "Sobre" (sobre encimera). ⚠ Si faltan medidas, null + "FALTA: medidas fregadero".
+• Grifo: círculo pequeño cerca del fregadero. Diámetro fijo 35mm por herramienta.
+• Enchufe: círculo marcado con "E" o "enchuf". Diámetro fijo 70mm por broca.
+• **Posición**: siempre indica distancia_frente_mm + posicion (izquierda/centro/derecha)
+  + distancia_lado_mm si aparecen en la nota. Si no, null + FALTA en notas.
 
 NOTACIÓN "-" (GUIÓN DESPUÉS DEL NÚMERO):
 • Ejemplo: "568-" en el chapeado → la medida debe descontarse el grosor del material.
@@ -69,14 +70,22 @@ NOTACIÓN "-" (GUIÓN DESPUÉS DEL NÚMERO):
 • Si tiene 30mm → se resta 32mm.
 • Si no se especifica el grosor aún, déjalo como "568-" en el campo de notas.
 
-ZONAS PULIDAS (X en las líneas):
-• Una línea con una X en el centro = esa arista va pulida.
-• Una medida pequeña (25-30mm) delimitada por "|X" = vuelo de la encimera (parte pulida
-  que sobresale del frente de los muebles). Anota su longitud.
+ACABADOS DE ARISTAS (inglete / pulido / bisel):
+Cada pieza rectangular tiene 4 aristas: "frente" (inferior = cara visible a la cocina),
+"fondo" (superior = pegada a la pared), "cabeza_izq" y "cabeza_der" (laterales).
 
-INGLETES:
-• "Ing." o "ingletes" junto a una arista = esa arista lleva inglete a 45°.
-• En rodapiés: las esquinas dibujadas en "L" significan que las cabezas van ingletadas.
+• INGLETE: uniones a 45° entre dos piezas (ej. cascada con encimera, rodapié en L).
+  - "Ing." o "ingletes" escrito junto a una arista.
+  - Rodapiés con esquinas dibujadas en "L" = las cabezas van ingletadas.
+  - En pilares de porcelánico, las 4 aristas visibles llevan inglete.
+  - Ángulo por defecto: 45.5° (el dueño usa esta holgura para montaje).
+• PULIDO: la arista se pule a mano (canteadora), no lleva corte especial CAM.
+  - Línea con una X en el centro = arista pulida.
+  - "|X" + número pequeño (25-30mm) = vuelo pulido (sobresale del frente del mueble).
+    Anota su longitud en pulido_vuelo_mm pero la arista frente lleva pulido.
+• BISEL: chaflán con disco inclinado. Ángulo y tamaño variables según el trabajo.
+  - "bisel X°" o "chaflán Xmm" junto a una arista.
+  - Menos frecuente que inglete y pulido. Si no ves indicador claro, deja null.
 
 MATERIALES PORCELÁNICOS (Dekton, Coverlam, Neolith, etc.):
 • El fregadero va SOBRE encimera (el hueco es para el fregadero apoyado encima).
@@ -109,7 +118,12 @@ Devuelve ÚNICAMENTE este JSON, sin texto adicional:
       "tiene_guion": false,
       "zona": "pared norte|isla|...",
       "pulido_vuelo_mm": 25,
-      "ingletes": ["cabeza_izq", "cabeza_der", "frente"],
+      "acabados_aristas": {
+        "frente":     {"tipo": null, "angulo": null, "profundidad_mm": null},
+        "fondo":      {"tipo": null, "angulo": null, "profundidad_mm": null},
+        "cabeza_izq": {"tipo": "inglete", "angulo": 45.5, "profundidad_mm": null},
+        "cabeza_der": {"tipo": "inglete", "angulo": 45.5, "profundidad_mm": null}
+      },
       "notas": "...",
       "huecos": [
         {
@@ -130,14 +144,19 @@ Devuelve ÚNICAMENTE este JSON, sin texto adicional:
 
 REGLAS IMPORTANTES:
 1. Todos los valores numéricos en mm (enteros o decimales).
-2. Si un valor no aparece claramente, usa null.
+2. ⚠ **Esto es producción, no presupuesto**. Si un valor no aparece claramente en la
+   nota, usa **null** y añade una línea en `notas` del tipo "FALTA CONFIRMAR: ancho
+   encimera" o "FALTA: placa medidas" — NO inventes medidas, NO uses valores típicos,
+   NO completes defaults. El operario rellenará los null en la UI.
 3. Para L-shapes: extrae las dos dimensiones generales (largo total × ancho total)
    y anota la forma como "L" con las medidas del recorte en "notas".
 4. Si ves varias fotos, extrae datos de LA FOTO DE MEDIDAS MANUSCRITAS.
    Ignora fotos de obra, renders o catálogos de aparatos.
 5. Si una medida tiene "-" (guión al final), marca tiene_guion: true en esa pieza.
-6. Indica siempre la posición del hueco respecto al frente de la encimera
-   (distancia_frente_mm) si aparece en la nota.
+6. Rellena acabados_aristas SOLO cuando veas indicadores claros en la nota (X de pulido,
+   L de rodapié, "Ing."). Si no hay pista, deja las 4 aristas con tipo: null — el
+   operario las marcará durante la revisión. Para ingletes (convención del negocio)
+   usa angulo: 45.5.
 """
 
 

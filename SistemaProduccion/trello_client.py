@@ -204,7 +204,10 @@ def cargar_config(config_path: Optional[Path] = None) -> "TrelloClient":
     """Carga credenciales del watcher_config.json y devuelve un TrelloClient."""
     if config_path is None:
         base = Path(__file__).parent.parent
-        config_path = base / "DXF_Acotador_Automatico" / "Instalacion para Windows" / "watcher_config.json"
+        # Preferir watcher_config_local.json (gitignored, con credenciales reales).
+        # Fallback a watcher_config.json (tracked en git, con placeholders).
+        local = base / "watcher_config_local.json"
+        config_path = local if local.exists() else (base / "watcher_config.json")
 
     with open(config_path, encoding="utf-8") as f:
         cfg = json.load(f)

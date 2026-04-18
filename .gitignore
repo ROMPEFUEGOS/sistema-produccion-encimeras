@@ -26,3 +26,12 @@ test_*.pdf
 
 # Credenciales - NUNCA subir
 .env
+watcher_config_local.json
+
+# Datos de trabajo (anotaciones, imágenes Trello, DXFs/PDFs generados por sesión)
+revisiones/
+
+# Prototipos exploratorios abandonados
+SistemaProduccion/segmentador_claude.py
+SistemaProduccion/segmentador_grid.py
+/tmp/
