@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from trello_client import cargar_config, TrelloClient
 from medidas_extractor import extraer_medidas
 from anotador import anotar_pieza
-from sintetizador import sintetizar_piezas
+from sintetizador import sintetizar_piezas, refinar_piezas
 import dxf_produccion
 
 
@@ -202,6 +202,8 @@ def generar_dxf(numero):
         carp = carpeta_orden(numero)
         salida = carp / "produccion.dxf"
         dxf_produccion.generar_dxf(medidas, salida)
+        # Re-guardar con los _defaults_aplicados que generar_dxf haya añadido
+        guardar_corregidas(numero, medidas)
         return jsonify({"ok": True, "dxf": str(salida.name)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
@@ -216,6 +218,56 @@ def imagen(numero, nombre):
     return send_file(p)
 
 
+@app.route("/crop/<numero>/<nombre>")
+def crop_preview(numero, nombre):
+    """
+    Devuelve un JPEG con el recorte de <nombre> según los parámetros de query:
+    ?x1=&y1=&x2=&y2= (normalizados 0-1).
+    Usa PIL para manejar EXIF correctamente (phone photos con rotation).
+    """
+    from PIL import Image as _PILImage
+    import io as _io
+    try:
+        x1 = float(request.args.get("x1", 0))
+        y1 = float(request.args.get("y1", 0))
+        x2 = float(request.args.get("x2", 1))
+        y2 = float(request.args.get("y2", 1))
+    except ValueError:
+        abort(400)
+
+    p = carpeta_orden(numero) / "imagenes" / nombre
+    if not p.exists():
+        abort(404)
+
+    img = _PILImage.open(p)
+    # Aplicar orientación EXIF para que las coords normalizadas coincidan con lo
+    # que el usuario ve en el navegador.
+    try:
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    img = img.convert("RGB")
+
+    W, H = img.size
+    px1 = max(0, int(x1 * W)); py1 = max(0, int(y1 * H))
+    px2 = min(W, int(x2 * W)); py2 = min(H, int(y2 * H))
+    if px2 <= px1 + 2 or py2 <= py1 + 2:
+        abort(400)
+    crop = img.crop((px1, py1, px2, py2))
+    # Reducir si es gigante
+    max_side = 900
+    if max(crop.size) > max_side:
+        ratio = max_side / max(crop.size)
+        crop = crop.resize((int(crop.size[0]*ratio), int(crop.size[1]*ratio)), _PILImage.LANCZOS)
+
+    buf = _io.BytesIO()
+    crop.save(buf, format="JPEG", quality=88)
+    buf.seek(0)
+    from flask import Response
+    return Response(buf.getvalue(), mimetype="image/jpeg")
+
+
 @app.route("/descargar/<numero>/<archivo>")
 def descargar(numero, archivo):
     carp = carpeta_orden(numero)
@@ -223,6 +275,50 @@ def descargar(numero, archivo):
     if not p.exists():
         abort(404)
     return send_file(p, as_attachment=True)
+
+
+@app.route("/subir_imagen/<numero>", methods=["POST"])
+def subir_imagen(numero):
+    """
+    Sube una imagen adicional a la carpeta de la orden (aparte de las de Trello).
+    Útil para añadir fotos de catálogo, referencias, renders que no están en la tarjeta.
+
+    Multipart form-data: archivo bajo el campo 'file'.
+    """
+    numero = numero.upper()
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "Falta archivo 'file'"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"ok": False, "error": "Archivo sin nombre"}), 400
+
+    ext = Path(f.filename).suffix.lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+        return jsonify({"ok": False, "error": f"Extensión no válida: {ext}. Usa jpg/png/webp"}), 400
+
+    carp = carpeta_orden(numero)
+    img_dir = carp / "imagenes"
+    img_dir.mkdir(exist_ok=True)
+
+    # Nombre seguro con prefijo 'local_' para distinguir de las de Trello
+    import re as _re
+    safe = _re.sub(r"[^\w.-]+", "_", Path(f.filename).stem)[:60]
+    dest = img_dir / f"local_{safe}{ext}"
+    i = 1
+    while dest.exists():
+        dest = img_dir / f"local_{safe}_{i}{ext}"
+        i += 1
+    f.save(dest)
+
+    # Actualizar la lista en el estado para que el sintetizador las use
+    datos = cargar_estado(numero)
+    if datos:
+        imgs = sorted(p.name for p in img_dir.iterdir() if p.is_file())
+        datos["_imagenes_disponibles"] = imgs
+        guardar_corregidas(numero, datos)
+
+    return jsonify({"ok": True, "nombre": dest.name,
+                    "tamaño_kb": dest.stat().st_size // 1024})
 
 
 @app.route("/ver/<numero>/<archivo>")
@@ -363,6 +459,238 @@ def borrar_anotacion(numero, ann_id):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _resumen_dxf_referencia(ruta_dxf: Path) -> str:
+    """Construye un texto con la lista de entidades de un DXF (para comparación)."""
+    import ezdxf, math
+    doc = ezdxf.readfile(str(ruta_dxf))
+    msp = doc.modelspace()
+
+    bloques = [f"=== DXF DE REFERENCIA (diseño manual del taller) — {ruta_dxf.name} ===\n"]
+    bloques.append("Convenciones del DXF de referencia:")
+    bloques.append("  layer 0            = cortes de disco (perímetro de piezas, huecos rectangulares)")
+    bloques.append("  layer 0-CON / ARCs = fresado curvo (esquinas redondeadas de fregadero)")
+    bloques.append("  layer 1007         = marcador de PULIDO (línea paralela a 10-15mm del borde pulido)")
+    bloques.append("  layer 1000INC{ang} = corte inclinado del disco (ingletes/biseles)")
+    bloques.append("  layer 1006         = taladros (enchufe/grifo), CIRCLE")
+    bloques.append("")
+
+    for tipo in ("LINE", "ARC", "CIRCLE"):
+        ents = [e for e in msp if e.dxftype() == tipo]
+        if not ents: continue
+        bloques.append(f"--- {tipo} ({len(ents)}) ---")
+        for e in ents:
+            if tipo == "LINE":
+                s, t = e.dxf.start, e.dxf.end
+                L = math.hypot(t.x-s.x, t.y-s.y)
+                bloques.append(f"  layer={e.dxf.layer:<12} "
+                               f"({s.x:.0f},{s.y:.0f})→({t.x:.0f},{t.y:.0f}) len={L:.0f} lt={e.dxf.linetype}")
+            elif tipo == "ARC":
+                c = e.dxf.center
+                bloques.append(f"  layer={e.dxf.layer:<12} "
+                               f"centro=({c.x:.0f},{c.y:.0f}) r={e.dxf.radius:.0f} "
+                               f"ang={e.dxf.start_angle:.0f}°→{e.dxf.end_angle:.0f}°")
+            elif tipo == "CIRCLE":
+                c = e.dxf.center
+                bloques.append(f"  layer={e.dxf.layer:<12} "
+                               f"centro=({c.x:.0f},{c.y:.0f}) r={e.dxf.radius:.0f}")
+        bloques.append("")
+    return "\n".join(bloques)
+
+
+@app.route("/comparar_ref/<numero>", methods=["POST"])
+def comparar_ref(numero):
+    """
+    Compara exhaustivamente el estado actual de piezas con un DXF manual de referencia.
+    Parsea el DXF, construye un prompt con sus entidades, y lo envía a refinar_piezas.
+
+    Body JSON: {ruta_dxf: "/ruta/absoluta/al.dxf", alcance: "encimeras" | "todas"}
+      - alcance="encimeras": Claude solo corrige piezas de encimera/isla (el ref típico
+        no incluye copetes/rodapiés). Las demás se dejan intactas.
+    """
+    numero = numero.upper()
+    try:
+        payload = request.get_json(force=True)
+        ruta = (payload.get("ruta_dxf") or "").strip()
+        alcance = (payload.get("alcance") or "encimeras").strip().lower()
+        if not ruta:
+            return jsonify({"ok": False, "error": "Falta ruta_dxf"}), 400
+        p_dxf = Path(ruta).expanduser()
+        if not p_dxf.exists():
+            return jsonify({"ok": False, "error": f"No existe: {p_dxf}"}), 404
+        if p_dxf.suffix.lower() != ".dxf":
+            return jsonify({"ok": False, "error": "El archivo no es .dxf"}), 400
+
+        datos = cargar_estado(numero)
+        if not datos or not datos.get("piezas"):
+            return jsonify({"ok": False, "error": "No hay piezas sintetizadas; sintetiza primero"}), 400
+
+        dxf_text = _resumen_dxf_referencia(p_dxf)
+
+        instruc_alcance = {
+            "encimeras": ("**Alcance**: Solo corrige piezas de tipo encimera/isla/cascada "
+                          "y sus huecos. El DXF de referencia normalmente no incluye "
+                          "copetes/rodapiés/zócalos — esas piezas déjalas intactas."),
+            "todas":     ("**Alcance**: compara todas las piezas. Si una pieza del JSON "
+                          "no aparece en el DXF ref, puedes marcarla con DUDA."),
+        }.get(alcance, "Alcance: todas")
+
+        correccion = (
+            "Comparación exhaustiva con DXF de referencia del taller.\n\n"
+            "Te paso a continuación el diseño MANUAL del taller para esta obra. "
+            "Compara exhaustivamente con las piezas que has sintetizado y reporta:\n"
+            "1. Diferencias en dimensiones (largo/ancho/alto/grosor) de cada pieza\n"
+            "2. Diferencias en posiciones y medidas de huecos (placa, fregadero, grifo, enchufes)\n"
+            "3. Diferencias en acabados (qué aristas van pulidas según layer 1007)\n"
+            "4. Diferencias en descuadros (compara pendiente top/bottom de cada encimera)\n"
+            "5. Piezas tuyas que no aparecen en la referencia, o viceversa\n"
+            "6. Fregaderos con esquinas redondeadas: el ref usa ARCs — verifica radio_esquina_mm\n"
+            "7. Ingletes/biseles: si hay layer 1000INC{ang} en ref, ajusta acabados_aristas\n\n"
+            f"{instruc_alcance}\n\n"
+            "Si detectas errores tuyos, CORRÍGELOS y devuelve las piezas actualizadas. "
+            "Si hay ambigüedades, márcalas en razonamiento con 'DUDA: ...'. "
+            "Si detectas una convención o modelo de aparato (fregadero/placa) con medidas "
+            "estándar que puede reutilizarse, añade una línea 'REGLA CANDIDATA: ...' al "
+            "razonamiento_global.\n\n"
+            f"{dxf_text}\n\n"
+            "Fin del DXF de referencia. Aplica correcciones a las piezas y devuelve el JSON completo."
+        )
+
+        carp = carpeta_orden(numero)
+        piezas_antes = list(datos["piezas"])
+        raz_antes = datos.get("razonamiento_global", "")
+
+        resultado = refinar_piezas(
+            piezas_actuales=piezas_antes,
+            anotaciones=datos.get("anotaciones", []),
+            correccion=correccion,
+            imagenes_dir=carp / "imagenes",
+            razonamiento_global_actual=raz_antes,
+        )
+
+        datos["piezas"]              = resultado.get("piezas", piezas_antes)
+        datos["razonamiento_global"] = resultado.get("razonamiento_global", raz_antes)
+        datos["anotaciones_contextuales_ids"] = resultado.get(
+            "anotaciones_contextuales_ids",
+            datos.get("anotaciones_contextuales_ids", []))
+        import datetime
+        datos["ultima_correccion"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+        # Log
+        log_path = carp / "correcciones.jsonl"
+        entry = {
+            "timestamp":      datos["ultima_correccion"],
+            "correccion":     f"[COMPARAR REF DXF] {p_dxf.name} (alcance={alcance})",
+            "ruta_referencia": str(p_dxf),
+            "piezas_antes":   piezas_antes,
+            "piezas_despues": datos["piezas"],
+            "razonamiento_antes":   raz_antes,
+            "razonamiento_despues": datos["razonamiento_global"],
+            "tokens_in":      resultado.get("_meta", {}).get("input_tokens"),
+            "tokens_out":     resultado.get("_meta", {}).get("output_tokens"),
+        }
+        datos.setdefault("correcciones_historial", []).append({
+            "timestamp":  entry["timestamp"],
+            "correccion": entry["correccion"],
+            "delta_razonamiento": datos["razonamiento_global"],
+        })
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        guardar_corregidas(numero, datos)
+
+        meta = resultado.get("_meta", {})
+        return jsonify({
+            "ok":                  True,
+            "piezas":              datos["piezas"],
+            "razonamiento_global": datos["razonamiento_global"],
+            "correcciones_historial": datos["correcciones_historial"],
+            "tokens_in":           meta.get("input_tokens"),
+            "tokens_out":          meta.get("output_tokens"),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "trace": traceback.format_exc()}), 500
+
+
+@app.route("/refinar/<numero>", methods=["POST"])
+def refinar(numero):
+    """
+    Fase 3: corrección en lenguaje natural. El usuario describe qué está mal y
+    Claude re-sintetiza manteniendo coherencia.
+
+    Body JSON: {correccion: "texto libre"}
+    """
+    numero = numero.upper()
+    try:
+        payload = request.get_json(force=True)
+        correccion = (payload.get("correccion") or "").strip()
+        if not correccion:
+            return jsonify({"ok": False, "error": "correccion vacía"}), 400
+
+        datos = cargar_estado(numero)
+        if not datos or not datos.get("piezas"):
+            return jsonify({"ok": False, "error": "No hay piezas sintetizadas aún; sintetiza primero"}), 400
+
+        carp = carpeta_orden(numero)
+        imagenes_dir = carp / "imagenes"
+
+        piezas_antes = list(datos["piezas"])
+        raz_antes    = datos.get("razonamiento_global", "")
+
+        resultado = refinar_piezas(
+            piezas_actuales=piezas_antes,
+            anotaciones=datos.get("anotaciones", []),
+            correccion=correccion,
+            imagenes_dir=imagenes_dir,
+            razonamiento_global_actual=raz_antes,
+        )
+
+        datos["piezas"]              = resultado.get("piezas", piezas_antes)
+        datos["razonamiento_global"] = resultado.get("razonamiento_global", raz_antes)
+        datos["anotaciones_contextuales_ids"] = resultado.get(
+            "anotaciones_contextuales_ids",
+            datos.get("anotaciones_contextuales_ids", []))
+        import datetime
+        datos["ultima_correccion"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+        # Log estructurado de la corrección (base para extracción futura de reglas)
+        log_path = carp / "correcciones.jsonl"
+        entry = {
+            "timestamp":        datos["ultima_correccion"],
+            "correccion":       correccion,
+            "piezas_antes":     piezas_antes,
+            "piezas_despues":   datos["piezas"],
+            "razonamiento_antes":   raz_antes,
+            "razonamiento_despues": datos["razonamiento_global"],
+            "tokens_in":  resultado.get("_meta", {}).get("input_tokens"),
+            "tokens_out": resultado.get("_meta", {}).get("output_tokens"),
+        }
+        # Guardar historial en el propio JSON para mostrarlo en la UI
+        datos.setdefault("correcciones_historial", []).append({
+            "timestamp":  entry["timestamp"],
+            "correccion": correccion,
+            "delta_razonamiento": datos["razonamiento_global"],
+        })
+
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        guardar_corregidas(numero, datos)
+
+        meta = resultado.get("_meta", {})
+        return jsonify({
+            "ok":                  True,
+            "piezas":              datos["piezas"],
+            "razonamiento_global": datos["razonamiento_global"],
+            "correcciones_historial": datos["correcciones_historial"],
+            "tokens_in":           meta.get("input_tokens"),
+            "tokens_out":          meta.get("output_tokens"),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "trace": traceback.format_exc()}), 500
+
+
 @app.route("/sintetizar/<numero>", methods=["POST"])
 def sintetizar(numero):
     """
@@ -404,24 +732,28 @@ def sintetizar(numero):
 
 @app.route("/pdf/<numero>", methods=["POST"])
 def generar_pdf(numero):
-    """Genera el PDF acotado a partir del DXF actual usando dxf_auto_dim_v1.3.py."""
+    """Genera el PDF acotado. SIEMPRE regenera el DXF primero para reflejar el estado actual."""
     numero = numero.upper()
     try:
         carp = carpeta_orden(numero)
-        dxf = carp / "produccion.dxf"
-        if not dxf.exists():
-            # Auto-generar DXF primero si no existe
-            medidas = request.get_json(force=True, silent=True) or cargar_estado(numero)
-            if not medidas:
-                return jsonify({"ok": False, "error": "Genera primero el DXF"}), 400
-            guardar_corregidas(numero, medidas)
-            dxf_produccion.generar_dxf(medidas, dxf)
+        dxf  = carp / "produccion.dxf"
+        medidas = request.get_json(force=True, silent=True) or cargar_estado(numero)
+        if not medidas:
+            return jsonify({"ok": False, "error": "Sin datos de piezas"}), 400
+        guardar_corregidas(numero, medidas)
+        # Regenerar siempre el DXF desde el estado actual (no confiar en el anterior).
+        # generar_dxf muta cada pieza con `_defaults_aplicados` cuando aplica defaults
+        # para huecos — guardamos de nuevo para que el dimensioner los muestre en el PDF.
+        dxf_produccion.generar_dxf(medidas, dxf)
+        guardar_corregidas(numero, medidas)
 
         pdf = carp / "produccion.pdf"
-        proc = subprocess.run(
-            ["python3", str(DIMENSIONER_SCRIPT), str(dxf), "-o", str(pdf)],
-            capture_output=True, text=True, timeout=120,
-        )
+        datos_json = carp / "medidas_corregidas.json"
+        cmd = ["python3", str(DIMENSIONER_SCRIPT), str(dxf), "-o", str(pdf)]
+        if datos_json.exists():
+            cmd += ["--datos", str(datos_json),
+                    "--imagenes-dir", str(carp / "imagenes")]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if proc.returncode != 0:
             return jsonify({"ok": False, "error": "Dimensioner falló",
                             "stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:]}), 500
@@ -510,6 +842,7 @@ header button { padding: 8px 14px; font-size: 14px; cursor: pointer; border: 0; 
 .btn-annot { background: #c62828; color: white; }
 .btn-annot.on { background: #2e7d32; }
 .btn-sint  { background: #6a1b9a; color: white; }
+.btn-ref   { background: #00695c; color: white; }
 .stale-banner { background: #fff3cd; color: #856404; border: 1px solid #ffeeba;
   padding: 8px 12px; margin-bottom: 8px; border-radius: 4px; font-size: 13px; }
 .razonamiento-global { background: #e3f2fd; border: 1px solid #90caf9; color: #0d47a1;
@@ -519,9 +852,30 @@ header button { padding: 8px 14px; font-size: 14px; cursor: pointer; border: 0; 
   padding: 6px 10px; margin: 6px 0; font-size: 12px; color: #4a148c;
   white-space: pre-wrap; }
 .anot-ids { font-size: 11px; color: #666; margin-left: 6px; }
+
+.refinar-panel { background: #fff8e1; border: 1px solid #ffd54f; border-radius: 6px;
+  padding: 10px 12px; margin-top: 12px; }
+.refinar-panel h4 { margin: 0 0 6px; font-size: 14px; color: #6d4c00; }
+.refinar-panel .hint { font-size: 11px; color: #666; margin-bottom: 6px; }
+.refinar-panel textarea { width: 100%; min-height: 80px; padding: 8px; font-size: 13px;
+  font-family: inherit; resize: vertical; box-sizing: border-box;
+  border: 1px solid #ffca28; border-radius: 3px; background: white; }
+.refinar-panel .acciones { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.refinar-panel button { padding: 6px 14px; font-size: 13px; border: 0; border-radius: 3px;
+  cursor: pointer; background: #ef6c00; color: white; }
+.refinar-panel button:disabled { opacity: 0.5; cursor: not-allowed; }
+.correcciones-historial { margin-top: 10px; font-size: 12px; }
+.correcciones-historial h5 { margin: 0 0 4px; font-size: 12px; color: #555; }
+.correccion-item { background: white; border-left: 3px solid #ef6c00;
+  padding: 6px 8px; margin-bottom: 4px; border-radius: 0 3px 3px 0; }
+.correccion-item .ts { color: #999; font-size: 10px; }
+.correccion-item .txt { white-space: pre-wrap; color: #333; }
 main { display: grid; grid-template-columns: 1fr 1fr; height: calc(100vh - 52px); }
 .panel-img { border-right: 1px solid #ddd; background: #eee; display: flex; flex-direction: column; overflow: hidden; }
-.thumb-bar { display: flex; gap: 4px; padding: 4px; background: #263238; overflow-x: auto; flex: 0 0 auto; }
+.thumb-bar { display: flex; gap: 4px; padding: 4px; background: #263238; overflow-x: auto; flex: 0 0 auto; align-items: center; }
+.thumb-bar .upload-btn { flex: 0 0 auto; padding: 8px 12px; background: #ff7043; color: white;
+  border: 0; border-radius: 3px; cursor: pointer; font-size: 12px; font-weight: bold; }
+.thumb-bar .upload-btn:hover { background: #e64a19; }
 .thumb { position: relative; cursor: pointer; flex: 0 0 auto; border: 3px solid transparent; background: black; }
 .thumb.active { border-color: #42a5f5; }
 .thumb.nota  { border-color: #66bb6a; }
@@ -606,6 +960,7 @@ details.notas summary { cursor: pointer; color: #555; }
   <div class="spacer"></div>
   <button class="btn-annot" id="btn-annot" onclick="toggleAnnotMode()">📍 Anotar</button>
   <button class="btn-sint"  id="btn-sint"  onclick="sintetizar()">🧠 Sintetizar piezas</button>
+  <button class="btn-ref"   id="btn-ref"   onclick="compararRef()">🔎 Comparar DXF ref</button>
   <button class="btn-reset" onclick="reiniciar()">Descartar</button>
   <button class="btn-save" onclick="guardar()">💾</button>
   <button class="btn-dxf" onclick="generarDxf()">▶ DXF</button>
@@ -775,16 +1130,27 @@ function piezaFaltantes(p) {
   // Misma lógica que validar_pieza() en dxf_produccion.py
   const faltan = [];
   const tipo = (p.tipo || "").toLowerCase();
-  const largo = p.largo_mm;
-  const ancho = p.ancho_mm;
-  const alto  = p.alto_mm;
-  if (!largo) faltan.push("largo_mm");
-  if (["encimera","isla","cascada"].includes(tipo)) {
-    if (!ancho) faltan.push("ancho_mm (fondo)");
-  } else if (["chapeado","frontal","pilastra","costado","copete","rodapie","zocalo","paso","tabica"].includes(tipo)) {
-    if (!alto && !ancho) faltan.push("alto_mm (altura)");
+
+  // Si hay contorno_custom con >=3 vértices válidos, saltamos validación de largo/ancho
+  const cc = p.contorno_custom;
+  const verts = cc && cc.vertices_mm;
+  if (verts && verts.length >= 3) {
+    const bad = verts.findIndex(v => !Array.isArray(v) || v.length < 2 || v[0]==null || v[1]==null);
+    if (bad >= 0) faltan.push(`contorno_custom vértice ${bad} inválido`);
+  } else if (cc) {
+    faltan.push("contorno_custom con menos de 3 vértices");
   } else {
-    if (!ancho && !alto) faltan.push("ancho_mm / alto_mm");
+    const largo = p.largo_mm;
+    const ancho = p.ancho_mm;
+    const alto  = p.alto_mm;
+    if (!largo) faltan.push("largo_mm");
+    if (["encimera","isla","cascada"].includes(tipo)) {
+      if (!ancho) faltan.push("ancho_mm (fondo)");
+    } else if (["chapeado","frontal","pilastra","costado","copete","rodapie","zocalo","paso","tabica"].includes(tipo)) {
+      if (!alto && !ancho) faltan.push("alto_mm (altura)");
+    } else {
+      if (!ancho && !alto) faltan.push("ancho_mm / alto_mm");
+    }
   }
   (p.huecos || []).forEach((h, j) => {
     const t = (h.tipo || "").toLowerCase();
@@ -933,6 +1299,11 @@ function render() {
   // Piezas
   (datos.piezas || []).forEach((p, i) => panel.appendChild(renderPieza(p, i)));
 
+  // Panel de refinamiento (chat de correcciones) — solo si ya hay piezas sintetizadas
+  if ((datos.piezas || []).length) {
+    panel.appendChild(renderRefinarPanel());
+  }
+
   // Botón añadir pieza
   panel.appendChild(el("button", {class:"add-btn", style:"font-size:14px;padding:8px 14px",
     onclick: () => { datos.piezas.push({tipo:"encimera", forma:"rectangular", huecos:[]}); render(); }
@@ -1029,8 +1400,23 @@ async function reiniciar() {
 
 function renderThumbs() {
   const bar = $("#thumbs");
-  if (!bar || !IMAGENES.length) return;
+  if (!bar) return;
   bar.innerHTML = "";
+
+  // Botón para subir imagen adicional
+  const uploadBtn = el("button", {class: "upload-btn",
+    title: "Subir imagen adicional (catálogo, referencia, render...)",
+    onclick: (ev) => { ev.stopPropagation(); $("#upload-file").click(); }
+  }, "+ imagen");
+  bar.appendChild(uploadBtn);
+
+  // Input file oculto
+  const fileInput = el("input", {type: "file", id: "upload-file",
+    accept: "image/jpeg,image/png,image/webp",
+    style: "display:none",
+    onchange: (ev) => subirImagen(ev.target.files[0])});
+  bar.appendChild(fileInput);
+
   IMAGENES.forEach((img, idx) => {
     const isNota = (img === IMAGEN_NOTA);
     const thumb = el("div", {
@@ -1152,16 +1538,12 @@ function abrirModal(bbox, rectEl) {
   currentAnnot = {bbox, rectEl};
   $("#modal-desc").value = "";
 
-  // Crop preview con canvas
-  const img = $("#nota");
-  const cW = Math.max(1, Math.round(img.naturalWidth  * (bbox[2] - bbox[0])));
-  const cH = Math.max(1, Math.round(img.naturalHeight * (bbox[3] - bbox[1])));
-  const canvas = document.createElement("canvas");
-  canvas.width = cW; canvas.height = cH;
-  canvas.getContext("2d").drawImage(img,
-    bbox[0] * img.naturalWidth, bbox[1] * img.naturalHeight, cW, cH,
-    0, 0, cW, cH);
-  $("#modal-preview").src = canvas.toDataURL("image/jpeg", 0.9);
+  // Preview del recorte vía backend (PIL maneja EXIF correctamente; evita canvas tainted)
+  const imagen = getCurrentImageName();
+  const url = `/crop/${NUMERO}/${encodeURIComponent(imagen)}` +
+              `?x1=${bbox[0].toFixed(4)}&y1=${bbox[1].toFixed(4)}` +
+              `&x2=${bbox[2].toFixed(4)}&y2=${bbox[3].toFixed(4)}&_t=${Date.now()}`;
+  $("#modal-preview").src = url;
 
   $("#modal-bg").classList.add("open");
   setTimeout(() => $("#modal-desc").focus(), 50);
@@ -1207,6 +1589,135 @@ async function enviarAnotacion() {
     }
   } finally {
     btn.disabled = false; btn.textContent = "Guardar anotación";
+  }
+}
+
+function renderRefinarPanel() {
+  const cont = el("div", {class: "refinar-panel"});
+  cont.appendChild(el("h4", {}, "🗣 Corregir con contexto (refinar)"));
+  cont.appendChild(el("div", {class: "hint"},
+    "Escribe en lenguaje natural qué está mal y por qué. Refiérete a las piezas por #N. " +
+    "Claude re-sintetiza manteniendo coherencia del resto. Cada corrección queda registrada."));
+
+  const ta = el("textarea", {id: "refinar-txt",
+    placeholder: "Ej: La pieza #3 no debería existir, es contexto de la leyenda. Mueve el hueco del fregadero de la pieza #2 a 150mm del frente en lugar de 100mm."});
+  cont.appendChild(ta);
+
+  const acciones = el("div", {class: "acciones"});
+  const btn = el("button", {onclick: enviarCorreccion, id: "btn-refinar"}, "Corregir con Claude");
+  acciones.appendChild(btn);
+  cont.appendChild(acciones);
+
+  // Historial de correcciones previas
+  const hist = datos.correcciones_historial || [];
+  if (hist.length) {
+    const h = el("div", {class: "correcciones-historial"});
+    h.appendChild(el("h5", {}, `Correcciones aplicadas (${hist.length})`));
+    hist.slice().reverse().forEach(c => {
+      const it = el("div", {class: "correccion-item"});
+      it.appendChild(el("div", {class: "ts"}, c.timestamp || ""));
+      it.appendChild(el("div", {class: "txt"}, c.correccion));
+      h.appendChild(it);
+    });
+    cont.appendChild(h);
+  }
+
+  return cont;
+}
+
+async function enviarCorreccion() {
+  const txt = ($("#refinar-txt").value || "").trim();
+  if (!txt) { alert("Escribe la corrección primero"); return; }
+
+  const btn = $("#btn-refinar");
+  btn.disabled = true; btn.textContent = "Re-sintetizando...";
+  setStatus("Claude aplicando corrección... (15-40s)");
+
+  try {
+    const res = await fetch(`/refinar/${NUMERO}`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({correccion: txt}),
+    });
+    const j = await res.json();
+    if (j.ok) {
+      datos.piezas              = j.piezas;
+      datos.razonamiento_global = j.razonamiento_global;
+      datos.correcciones_historial = j.correcciones_historial;
+      setStatus(`✓ Corrección aplicada · ${datos.piezas.length} piezas · tokens ${j.tokens_in}→${j.tokens_out}`, true);
+      render();
+      renderBadges();
+    } else {
+      setStatus("✗ " + j.error, false);
+      alert("Error: " + j.error);
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = "Corregir con Claude";
+  }
+}
+
+async function subirImagen(file) {
+  if (!file) return;
+  setStatus(`Subiendo ${file.name}...`);
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const res = await fetch(`/subir_imagen/${NUMERO}`, {method: "POST", body: fd});
+    const j = await res.json();
+    if (j.ok) {
+      setStatus(`✓ Imagen subida: ${j.nombre} (${j.tamaño_kb}KB)`, true);
+      // Recargar para que la lista de thumbnails se actualice con la imagen nueva
+      setTimeout(() => location.reload(), 800);
+    } else {
+      setStatus("✗ " + j.error, false);
+      alert("Error: " + j.error);
+    }
+  } catch (e) {
+    setStatus("✗ " + e.message, false);
+  }
+}
+
+async function compararRef() {
+  if (!datos.piezas || !datos.piezas.length) {
+    alert("Primero sintetiza las piezas. El comparador corrige una síntesis existente.");
+    return;
+  }
+  const ruta = prompt(
+    "Ruta del DXF de referencia (diseño manual del taller). " +
+    "Ej: /home/kecojones/Documents/.../T7010_xxx.dxf",
+    localStorage.getItem("ultima_ruta_ref_" + NUMERO) || ""
+  );
+  if (!ruta) return;
+  localStorage.setItem("ultima_ruta_ref_" + NUMERO, ruta);
+
+  const alcance = confirm(
+    "OK = comparar solo encimeras/islas (habitual si el DXF no trae copetes/rodapiés). " +
+    "Cancelar = comparar todas las piezas."
+  ) ? "encimeras" : "todas";
+
+  const btn = $("#btn-ref");
+  btn.disabled = true; btn.textContent = "🔎 Comparando...";
+  setStatus("Parseando DXF ref y llamando a Claude... (20-60s)");
+
+  try {
+    const res = await fetch(`/comparar_ref/${NUMERO}`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ruta_dxf: ruta, alcance: alcance}),
+    });
+    const j = await res.json();
+    if (j.ok) {
+      datos.piezas              = j.piezas;
+      datos.razonamiento_global = j.razonamiento_global;
+      datos.correcciones_historial = j.correcciones_historial;
+      setStatus(`✓ Comparación aplicada · ${datos.piezas.length} piezas · tokens ${j.tokens_in}→${j.tokens_out}`, true);
+      render();
+      renderBadges();
+    } else {
+      setStatus("✗ " + j.error, false);
+      console.error(j.trace || j);
+      alert("Error: " + j.error);
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = "🔎 Comparar DXF ref";
   }
 }
 

@@ -30,6 +30,28 @@ MAX_IMG_SIDE  = 1600
 MAX_CROP_SIDE = 1200
 MAX_IMAGENES_COMPLETAS = 3   # como mucho 3 imágenes completas (las más pesadas)
 
+# Archivo de reglas del negocio — se inyecta en el system prompt si existe
+REGLAS_FILE = Path(__file__).parent / "reglas_negocio.md"
+
+
+def _leer_reglas_negocio() -> str:
+    """Lee el archivo de reglas del negocio si existe, devuelve string vacío si no."""
+    if REGLAS_FILE.exists():
+        return REGLAS_FILE.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def _build_system_prompt(base: str) -> list[dict]:
+    """Construye el system prompt como lista de bloques, con reglas_negocio.md al final."""
+    reglas = _leer_reglas_negocio()
+    bloques = [{"type": "text", "text": base,
+                "cache_control": {"type": "ephemeral"}}]
+    if reglas:
+        bloques.append({"type": "text",
+                        "text": f"\n\n=== REGLAS ACUMULADAS DEL NEGOCIO "
+                                f"(lee con prioridad — sobrescriben al prompt base si hay conflicto) ===\n\n{reglas}"})
+    return bloques
+
 
 SYSTEM_PROMPT = """Eres un experto en fabricación de encimeras de cocina de piedra natural y porcelánico.
 
@@ -62,6 +84,25 @@ Sintetizar toda la evidencia y devolver la lista COHERENTE de piezas finales a f
   largo real es 2450", usa 2450 y menciona la corrección en el razonamiento.
 
 ### Convenciones del negocio
+
+**REGLA CRÍTICA sobre contornos de pieza**:
+
+> **"Si van separadas se dibujan separadas."** Una pieza = un único contorno cerrado
+> en la nota. Varias piezas = varios contornos dibujados por separado.
+>
+> - NO interpretes escuadras internas, marcas de ángulo, líneas diagonales en medio
+>   del dibujo o cualquier señal interna como "división de una pieza en dos".
+>   Eso marca uniones con piezas adyacentes (que están dibujadas aparte), pilares,
+>   referencias de montaje o pliegues visuales, pero la pieza sigue siendo UNA.
+> - `forma = "L"` o `"U"` solo cuando el CONTORNO EXTERIOR dibujado realmente describe
+>   esa forma (cambio real de dirección a lo largo del perímetro). Si el contorno
+>   exterior es rectangular aunque tenga marcas interiores, `forma = "rectangular"`.
+> - Si el usuario dibujó 2 rectángulos separados, son 2 piezas, aunque uno toque al
+>   otro y sumen medidas coherentes entre ellos.
+> - En caso de duda, CONFÍA en que si hubiera dos piezas estarían dibujadas como
+>   contornos separados. Solo agrupa lo que el dibujo ya agrupa.
+
+**Otras convenciones**:
 - Inglete por defecto 45.5° (holgura de montaje). Si no se dice ángulo pero hay
   inglete, usa 45.5.
 - Bisel: ángulo y profundidad variables, siempre que el usuario lo especifique.
@@ -71,6 +112,109 @@ Sintetizar toda la evidencia y devolver la lista COHERENTE de piezas finales a f
 - Encimera: ancho_mm = fondo (profundidad). Chapeado: alto_mm = altura vertical.
 - "B/E" o "bajoencimera" → subtipo="bajo_encimera"; "SE" o "sobre" → "sobre_encimera".
 - "568-" (guión al final) → tiene_guion=true, se resta grosor+2mm del material.
+
+### Contorno personalizado (obligatorio si la pieza NO es rectangular)
+
+Cuando `forma != "rectangular"` (L, U, trapezoidal, irregular, con chaflán, con
+esquina redondeada, con escalón, etc.), DEBES emitir el campo `contorno_custom`
+con los vértices ordenados en sentido **antihorario (CCW)** empezando por la
+esquina INFERIOR-IZQUIERDA.
+
+Schema de `contorno_custom`:
+```
+{
+  "vertices_mm": [[x0, y0], [x1, y1], ..., [xN, yN]],
+  "radios_esquina_mm": [r0, r1, ..., rN]  // radio de fillet en cada vértice, 0 si es esquina viva
+  "acabados_contorno": [
+    {"tipo": "inglete"|"bisel"|"pulido"|null, "angulo": ..., "profundidad_mm": ...},
+    ...  // uno por cada arista: la arista i va de vertice[i] a vertice[(i+1)%N]
+  ]
+}
+```
+
+Coordenadas en mm, origen = esquina inferior-izquierda de la pieza (0,0). Y
+creciente hacia el fondo (pared), X creciente hacia la derecha.
+
+Si una pieza rectangular necesita solo `acabados_aristas` (frente/fondo/cabezas),
+no emitas `contorno_custom`. Si la forma es no-rectangular, emite `contorno_custom`
+Y NO llenes `acabados_aristas` (los acabados van en `acabados_contorno`).
+
+### Ejemplos de contornos
+
+**1. Encimera trapezoidal** (pieza #2 de T3217): lado izq vertical 860mm, sup
+1335mm, inf 1165mm, lado der diagonal:
+```
+"contorno_custom": {
+  "vertices_mm": [[0,0], [1165,0], [1335,860], [0,860]],
+  "radios_esquina_mm": [0, 0, 0, 0],
+  "acabados_contorno": [
+    {"tipo": "pulido"},     // arista inferior (frente)
+    {"tipo": null},          // arista derecha diagonal (queda a copete, sin pulir)
+    {"tipo": "pulido"},     // arista superior
+    {"tipo": "pulido"}      // arista izquierda (cabeza izq)
+  ]
+}
+```
+
+**2. Encimera en L** (ancho total 2400, alto total 2200; tramo horizontal
+2400×600, tramo vertical 600×2200):
+```
+"contorno_custom": {
+  "vertices_mm": [[0,0], [2400,0], [2400,600], [600,600], [600,2200], [0,2200]],
+  "radios_esquina_mm": [0, 0, 0, 0, 0, 0],
+  "acabados_contorno": [
+    {"tipo": "pulido"}, {"tipo": "pulido"}, {"tipo": null},
+    {"tipo": null}, {"tipo": "pulido"}, {"tipo": "pulido"}
+  ]
+}
+```
+
+**3. Encimera con esquina redondeada** (rect 1500×600 con esquina sup-der r=50mm):
+```
+"contorno_custom": {
+  "vertices_mm": [[0,0], [1500,0], [1500,600], [0,600]],
+  "radios_esquina_mm": [0, 0, 50, 0],
+  "acabados_contorno": [
+    {"tipo": "pulido"}, {"tipo": null}, {"tipo": null}, {"tipo": null}
+  ]
+}
+```
+
+**4. Encimera con chaflán 45° en esquina** (rect 1500×600, chaflán 100mm×100mm
+en esquina sup-der):
+```
+"contorno_custom": {
+  "vertices_mm": [[0,0], [1500,0], [1500,500], [1400,600], [0,600]],
+  "radios_esquina_mm": [0, 0, 0, 0, 0],
+  "acabados_contorno": [
+    {"tipo": "pulido"}, {"tipo": null}, {"tipo": "pulido"},  // el chaflán suele ir pulido
+    {"tipo": null}, {"tipo": null}
+  ]
+}
+```
+
+**5. Encimera con escalón para columna** (2400×600 con muesca rectangular
+400×100 en la pared a 800mm del borde izq):
+```
+"contorno_custom": {
+  "vertices_mm": [[0,0], [2400,0], [2400,600], [1200,600], [1200,500], [800,500], [800,600], [0,600]],
+  "radios_esquina_mm": [0, 0, 0, 0, 0, 0, 0, 0],
+  "acabados_contorno": [
+    {"tipo": "pulido"}, {"tipo": null}, {"tipo": null},
+    {"tipo": null}, {"tipo": null}, {"tipo": null},
+    {"tipo": null}, {"tipo": null}
+  ]
+}
+```
+
+**Reglas de dibujo del contorno**:
+- Sentido antihorario (CCW): inferior→derecha→superior→izquierda.
+- Primer vértice: esquina inferior-izquierda (0,0).
+- Si la nota del usuario da medidas parciales (ej "1335 arriba, 1165 abajo"),
+  deduce los vértices completos manteniendo coherencia del polígono.
+- Si hay descuadros que afectan la geometría, INCLÚYELOS en los vértices (no
+  uses descuadro_*_mm; el polígono ya los contiene).
+- Las aristas diagonales se nombran por los vértices que unen (ej "1-2").
 
 ### Formato de respuesta
 
@@ -101,15 +245,35 @@ SOLO JSON válido, sin prosa alrededor, sin bloques ```:
       "anotaciones_ids": [3, 7, 12]
     }
   ],
-  "razonamiento_global": "Análisis general de 2-3 frases: cuántas piezas totales, dudas, anotaciones ignoradas (y por qué), piezas con información incompleta que requieren más anotaciones del usuario.",
-  "anotaciones_contextuales_ids": [1, 5, 8]
+  "razonamiento_global": "Análisis general de 2-3 frases...",
+  "anotaciones_contextuales_ids": [1, 5, 8],
+  "cliente": "...", "material": "...", "numero": "...",
+  "grosor_mm": 20
 }
 
 ### anotaciones_contextuales_ids
 
 Lista las IDs de anotaciones que SON contexto global (símbolos, convenciones,
 correcciones generales) y que por tanto NO corresponden a ninguna pieza concreta.
-Sirve al usuario para saber que las viste y te fueron útiles.
+
+### ⚠ grosor_mm al top-level
+
+Si la nota menciona "granito 20mm", "2cm", "Dekton 12mm", "Neolith 30mm" u otra
+indicación de **grosor del material**, emítelo en `grosor_mm` (número mm) al
+NIVEL SUPERIOR del JSON. NO lo metas en `alto_mm` ni `ancho_mm` de piezas.
+
+### ⚠ Dimensiones por tipo de pieza (importante, evita errores en DXF)
+
+| Tipo | `largo_mm` | `ancho_mm` | `alto_mm` |
+|------|------------|------------|-----------|
+| encimera / isla / cascada | largo | **fondo** (pared→frente) | null |
+| chapeado / frontal / pilastra | largo horizontal | null | **altura vertical visible** |
+| costado (cascada lateral isla) | largo | **fondo** (coincide encimera) | null |
+| copete | largo | null | **altura** (típica 50) |
+| rodapié / zócalo | largo | null | **altura** (típica 95-100) |
+
+Si la altura de rodapié/copete/chapeado no aparece en la nota, `alto_mm = null`
+y menciona "FALTA: altura" en razonamiento de esa pieza.
 """
 
 
@@ -236,16 +400,30 @@ def sintetizar_piezas(anotaciones: list[dict],
     content.append({"type": "text",
                     "text": "\n=== FIN ===\n\nSintetiza. Devuelve solo el JSON."})
 
-    msg = client.messages.create(
+    # Streaming obligatorio para outputs largos (SDK lo exige si max_tokens alto).
+    with client.messages.stream(
         model=MODEL,
-        max_tokens=8192,
-        system=[{"type": "text", "text": SYSTEM_PROMPT,
-                 "cache_control": {"type": "ephemeral"}}],
+        max_tokens=32000,
+        system=_build_system_prompt(SYSTEM_PROMPT),
         messages=[{"role": "user", "content": content}],
-    )
+    ) as stream:
+        for _ in stream.text_stream:
+            pass  # acumulación interna del SDK
+        msg = stream.get_final_message()
 
     raw = "".join(b.text for b in msg.content if b.type == "text")
-    data = _extract_json(raw)
+    stop_reason = getattr(msg, "stop_reason", None)
+    try:
+        data = _extract_json(raw)
+    except Exception as e:
+        dump_path = Path("/tmp") / f"sintetizar_raw_{msg.id[-8:]}.txt"
+        dump_path.write_text(f"stop_reason: {stop_reason}\nusage: {msg.usage}\n\n{raw}",
+                             encoding="utf-8")
+        raise ValueError(
+            f"Parse falló ({e}). stop_reason={stop_reason}. "
+            f"Respuesta raw en {dump_path}. "
+            f"Output tokens: {msg.usage.output_tokens}."
+        )
 
     data["_meta"] = {
         "model":         MODEL,
@@ -255,5 +433,102 @@ def sintetizar_piezas(anotaciones: list[dict],
         "cache_creation_input_tokens": getattr(msg.usage, "cache_creation_input_tokens", 0),
         "n_anotaciones": len(anotaciones),
         "n_imagenes_completas": MAX_IMAGENES_COMPLETAS if incluir_imagenes_completas else 0,
+    }
+    return data
+
+
+REFINAR_SYSTEM = """Eres el mismo experto en fabricación de encimeras. En una llamada anterior
+sintetizaste una lista de piezas a partir de las anotaciones del usuario. Ahora el
+usuario te envía una CORRECCIÓN en lenguaje natural (ej: "la pieza 3 está mal,
+debería ser 2450 no 2540"). Tu tarea es devolver la lista COMPLETA de piezas
+actualizada aplicando la corrección y MANTENIENDO COHERENCIA con el resto.
+
+Reglas:
+- Devuelve SIEMPRE la lista completa (todas las piezas, no solo las modificadas).
+- Si la corrección invalida piezas previas, elimínalas. Si genera nuevas, añádelas.
+- Mantén los campos `razonamiento` y `anotaciones_ids` de cada pieza, actualizándolos
+  si la corrección los afecta.
+- En el `razonamiento_global`, AÑADE una línea al final indicando qué se cambió en
+  este refinamiento (ej: "Refinado 2026-04-19: pieza #3 largo corregido a 2450").
+- Si la corrección enseña una convención nueva que aplica en general (no solo a esta
+  orden), MENCIÓNALA en `razonamiento_global` con el prefijo "REGLA CANDIDATA:" para
+  que el operario pueda añadirla luego a reglas_negocio.md.
+- Sigue todas las demás reglas del system prompt base y del archivo de reglas.
+
+Formato: MISMO JSON que sintetizar_piezas (piezas + razonamiento_global +
+anotaciones_contextuales_ids). SOLO JSON, sin prosa fuera.
+"""
+
+
+def refinar_piezas(piezas_actuales: list[dict],
+                   anotaciones: list[dict],
+                   correccion: str,
+                   imagenes_dir: Path,
+                   razonamiento_global_actual: str = "",
+                   api_key: Optional[str] = None) -> dict:
+    """
+    Aplica una corrección en lenguaje natural a las piezas sintetizadas anteriormente.
+    Devuelve la nueva lista de piezas completa.
+    """
+    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("Falta ANTHROPIC_API_KEY")
+    if not correccion or not correccion.strip():
+        raise ValueError("Corrección vacía")
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    content = []
+
+    # Imágenes completas (menos que en síntesis inicial para ahorrar tokens)
+    imgs_por_peso = []
+    for p in imagenes_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png"):
+            imgs_por_peso.append((p.stat().st_size, p))
+    imgs_por_peso.sort(reverse=True)
+    for _, p in imgs_por_peso[:2]:
+        img = _resize_img(Image.open(p).convert("RGB"), MAX_IMG_SIDE)
+        b64, mime = _encode_image(img)
+        content.append({"type": "text", "text": f"Imagen: {p.name}"})
+        content.append({"type": "image",
+                        "source": {"type": "base64", "media_type": mime, "data": b64}})
+
+    content.append({"type": "text",
+                    "text": "=== ANOTACIONES DEL USUARIO (referencia) ==="})
+    for a in anotaciones:
+        content.append({"type": "text",
+                        "text": f"#{a.get('id')} ({a.get('imagen')}): {a.get('descripcion','')[:500]}"})
+
+    content.append({"type": "text",
+                    "text": f"\n=== SÍNTESIS ANTERIOR ===\n"
+                            f"razonamiento_global: {razonamiento_global_actual}\n\n"
+                            f"piezas actuales:\n{json.dumps(piezas_actuales, ensure_ascii=False, indent=2)}"})
+
+    content.append({"type": "text",
+                    "text": f"\n=== CORRECCIÓN DEL USUARIO ===\n{correccion.strip()}\n\n"
+                            f"Devuelve el JSON completo actualizado."})
+
+    with client.messages.stream(
+        model=MODEL,
+        max_tokens=32000,
+        system=_build_system_prompt(REFINAR_SYSTEM),
+        messages=[{"role": "user", "content": content}],
+    ) as stream:
+        for _ in stream.text_stream:
+            pass
+        msg = stream.get_final_message()
+
+    raw = "".join(b.text for b in msg.content if b.type == "text")
+    try:
+        data = _extract_json(raw)
+    except Exception as e:
+        dump_path = Path("/tmp") / f"refinar_raw_{msg.id[-8:]}.txt"
+        dump_path.write_text(raw, encoding="utf-8")
+        raise ValueError(f"Parse falló ({e}). Raw en {dump_path}.")
+
+    data["_meta"] = {
+        "model":         MODEL,
+        "input_tokens":  msg.usage.input_tokens,
+        "output_tokens": msg.usage.output_tokens,
     }
     return data
