@@ -572,6 +572,10 @@ def comparar_ref(numero):
         datos["anotaciones_contextuales_ids"] = resultado.get(
             "anotaciones_contextuales_ids",
             datos.get("anotaciones_contextuales_ids", []))
+        # Propagar metadatos top-level si Claude los emitió
+        for campo in ("grosor_mm", "material", "cliente", "numero", "notas_generales"):
+            if resultado.get(campo) not in (None, "", 0):
+                datos[campo] = resultado[campo]
         import datetime
         datos["ultima_correccion"] = datetime.datetime.now().isoformat(timespec="seconds")
 
@@ -650,6 +654,10 @@ def refinar(numero):
         datos["anotaciones_contextuales_ids"] = resultado.get(
             "anotaciones_contextuales_ids",
             datos.get("anotaciones_contextuales_ids", []))
+        # Propagar metadatos top-level si Claude los emitió
+        for campo in ("grosor_mm", "material", "cliente", "numero", "notas_generales"):
+            if resultado.get(campo) not in (None, "", 0):
+                datos[campo] = resultado[campo]
         import datetime
         datos["ultima_correccion"] = datetime.datetime.now().isoformat(timespec="seconds")
 
@@ -1011,7 +1019,7 @@ details.notas summary { cursor: pointer; color: #555; }
 const NUMERO = "{{ numero }}";
 const IMAGENES = {{ imagenes|tojson }};
 const IMAGEN_NOTA = "{{ imagen_actual }}";
-const TIPOS_PIEZA = ["encimera","chapeado","copete","rodapie","isla","costado","pilastra","paso","tabica","zocalo","otro"];
+const TIPOS_PIEZA = ["encimera","chapeado","copete","rodapie","isla","costado","pilastra","paso","tabica","zocalo","gama","dintel","antepecho","otro"];
 const FORMAS = ["rectangular","L","U","irregular"];
 const TIPOS_HUECO = ["placa","fregadero","grifo","enchufe"];
 const SUBTIPOS_HUECO = ["","sobre_encimera","bajo_encimera"];
@@ -1146,7 +1154,7 @@ function piezaFaltantes(p) {
     if (!largo) faltan.push("largo_mm");
     if (["encimera","isla","cascada"].includes(tipo)) {
       if (!ancho) faltan.push("ancho_mm (fondo)");
-    } else if (["chapeado","frontal","pilastra","costado","copete","rodapie","zocalo","paso","tabica"].includes(tipo)) {
+    } else if (["chapeado","frontal","pilastra","costado","copete","rodapie","zocalo","paso","tabica","gama","dintel","antepecho"].includes(tipo)) {
       if (!alto && !ancho) faltan.push("alto_mm (altura)");
     } else {
       if (!ancho && !alto) faltan.push("ancho_mm / alto_mm");

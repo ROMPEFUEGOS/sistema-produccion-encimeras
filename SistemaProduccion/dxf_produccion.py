@@ -182,27 +182,32 @@ def _rect_con_acabados(msp, x, y, w, h, acabados: dict = None,
             _line(msp, a[0], a[1], b[0], b[1], layer=LAYER_CORTE)
             ext = acab.get("extension_mm") if isinstance(acab, dict) else None
             desde = (acab.get("desde") or "").lower() if isinstance(acab, dict) else ""
-            # desde_frente=True: el tramo pulido empieza en 'a' (inicio de la arista).
-            # Para edges de un rect CCW, a = vértice anterior en sentido CCW.
-            # "desde=frente" significa: desde el extremo más cercano al frente (y min).
+            desc_ini = float(acab.get("descuento_ini_mm") or 0) if isinstance(acab, dict) else 0
+            desc_fin = float(acab.get("descuento_fin_mm") or 0) if isinstance(acab, dict) else 0
             if desde == "frente":
                 desde_frente = (a[1] < b[1]) or (a[1] == b[1] and a[0] < b[0])
             elif desde == "fondo":
                 desde_frente = not ((a[1] < b[1]) or (a[1] == b[1] and a[0] < b[0]))
             else:
                 desde_frente = True
-            _marcar_pulido(msp, a, b, extension_mm=ext, desde_frente=desde_frente)
+            _marcar_pulido(msp, a, b, extension_mm=ext, desde_frente=desde_frente,
+                           descuento_ini_mm=desc_ini, descuento_fin_mm=desc_fin)
         else:
             _line(msp, a[0], a[1], b[0], b[1], layer=LAYER_CORTE)
 
 
-def _marcar_pulido(msp, a, b, offset=15.0, extension_mm=None, desde_frente=False):
+def _marcar_pulido(msp, a, b, offset=15.0, extension_mm=None, desde_frente=False,
+                   descuento_ini_mm=0.0, descuento_fin_mm=0.0):
     """
-    Dibuja una línea paralela al borde en layer 1007 (guía visual, no mecaniza)
-    a {offset}mm hacia el interior de la pieza. Sirve como marcador del pulido.
+    Dibuja línea paralela al borde en layer 1007 (guía visual, no mecaniza)
+    a {offset}mm hacia el interior de la pieza. Marca el pulido.
 
-    Si `extension_mm` está definido, solo se marca ese tramo (no toda la arista).
-    `desde_frente`=True → empieza desde a; False → desde b.
+    Tres modos (por prioridad):
+      1. descuento_ini_mm / descuento_fin_mm > 0: pulido central, descontando
+         ese tramo desde cada extremo. Usado por dintel/antepecho.
+      2. extension_mm: pulido parcial desde un extremo (desde_frente=True → desde
+         el inicio a; False → desde el final b).
+      3. Sin parámetros: pulido completo.
     """
     import math
     dx, dy = b[0] - a[0], b[1] - a[1]
@@ -212,19 +217,25 @@ def _marcar_pulido(msp, a, b, offset=15.0, extension_mm=None, desde_frente=False
     ux, uy = dx / length, dy / length
     nx, ny = -uy, ux  # normal hacia interior (CCW)
 
-    # Si hay extensión parcial, recortar el segmento
-    if extension_mm and extension_mm > 0 and extension_mm < length:
+    if descuento_ini_mm > 0 or descuento_fin_mm > 0:
+        s_off = float(descuento_ini_mm)
+        e_off = length - float(descuento_fin_mm)
+    elif extension_mm and extension_mm > 0 and extension_mm < length:
         ext = float(extension_mm)
         if desde_frente:
-            # Empieza en a, termina a `ext` mm en dirección ab
-            ax, ay = a
-            bx, by = a[0] + ux * ext, a[1] + uy * ext
+            s_off, e_off = 0.0, ext
         else:
-            # Empieza a `length-ext` mm, termina en b
-            ax, ay = a[0] + ux * (length - ext), a[1] + uy * (length - ext)
-            bx, by = b
+            s_off, e_off = length - ext, length
     else:
-        ax, ay = a; bx, by = b
+        s_off, e_off = 0.0, length
+
+    if e_off <= s_off + 1:
+        return  # tramo nulo o inverso
+
+    ax = a[0] + ux * s_off
+    ay = a[1] + uy * s_off
+    bx = a[0] + ux * e_off
+    by = a[1] + uy * e_off
 
     ax2, ay2 = ax + nx * offset, ay + ny * offset
     bx2, by2 = bx + nx * offset, by + ny * offset
@@ -239,6 +250,35 @@ def _hueco_rect(msp, x, y, w, h, layer=LAYER_CORTE, lt=LT_TAB):
     _rect(msp, x, y, w, h, layer=layer, lt=lt)
 
 
+RADIO_MIN_MAQUINA_MM = 20.0  # Por debajo de este radio la máquina no lo hace;
+                              # se dibuja recto y se anota "R{n}" para redondeo manual.
+
+
+def _hueco_rect_con_radios_anotados(msp, x, y, w, h, radio: float,
+                                     layer_lineas=LAYER_CORTE, lt_lineas=LT_TAB):
+    """
+    Dibuja un hueco rectangular SIN arcos (esquinas rectas) pero añade un TEXT
+    "R{n}" en cada esquina (capa DEFPOINTS — no mecaniza) para que el operario
+    redondee a mano tras el corte.
+
+    Se usa cuando el radio es menor que RADIO_MIN_MAQUINA_MM (20mm): la máquina
+    no lo puede hacer de forma fiable con fresa.
+    """
+    _rect(msp, x, y, w, h, layer=layer_lineas, lt=lt_lineas)
+    # Texto en las 4 esquinas. Offset hacia fuera para no solapar con la línea.
+    r_str = f"R{int(radio)}" if float(radio).is_integer() else f"R{radio}"
+    off = max(8.0, radio * 0.5)
+    for cx, cy in ((x, y), (x + w, y), (x + w, y + h), (x, y + h)):
+        try:
+            msp.add_text(r_str, dxfattribs={
+                "layer": "DEFPOINTS",
+                "height": max(8.0, radio * 1.2),
+                "insert": (cx, cy),
+            })
+        except Exception:
+            pass
+
+
 def _hueco_rect_con_radios(msp, x, y, w, h, radio: float,
                            layer_lineas=LAYER_CORTE, lt_lineas=LT_TAB,
                            layer_arcos=LAYER_FRESA):
@@ -247,9 +287,12 @@ def _hueco_rect_con_radios(msp, x, y, w, h, radio: float,
     Cada lado recto va como LINE en `layer_lineas` (disco), y cada esquina
     como ARC en `layer_arcos` (fresadora — el disco no puede curvas grandes).
 
-    Según CAM Rules: radios > 20mm van en 0-CON (fresado). Radios <= 20mm
-    podrían ir en capa de corte, pero para uniformidad usamos 0-CON siempre.
+    Según CAM Rules: radios > 20mm van en 0-CON (fresado).
+    Si el radio es < RADIO_MIN_MAQUINA_MM delega a `_hueco_rect_con_radios_anotados`.
     """
+    if radio < RADIO_MIN_MAQUINA_MM:
+        _hueco_rect_con_radios_anotados(msp, x, y, w, h, radio, layer_lineas, lt_lineas)
+        return
     import math
     r = float(radio)
     # Vertices del rectángulo
@@ -357,6 +400,8 @@ def _dibujar_contorno_custom(msp, pieza: dict, x_off: float, y_off: float) -> tu
             _line(msp, ax, ay, bx, by, layer=LAYER_CORTE)
             ext = acab.get("extension_mm")
             desde = (acab.get("desde") or "").lower()
+            desc_ini = float(acab.get("descuento_ini_mm") or 0)
+            desc_fin = float(acab.get("descuento_fin_mm") or 0)
             a_pt, b_pt = (ax, ay), (bx, by)
             if desde == "frente":
                 desde_frente = (a_pt[1] < b_pt[1]) or (a_pt[1] == b_pt[1] and a_pt[0] < b_pt[0])
@@ -364,7 +409,8 @@ def _dibujar_contorno_custom(msp, pieza: dict, x_off: float, y_off: float) -> tu
                 desde_frente = not ((a_pt[1] < b_pt[1]) or (a_pt[1] == b_pt[1] and a_pt[0] < b_pt[0]))
             else:
                 desde_frente = True
-            _marcar_pulido(msp, a_pt, b_pt, extension_mm=ext, desde_frente=desde_frente)
+            _marcar_pulido(msp, a_pt, b_pt, extension_mm=ext, desde_frente=desde_frente,
+                           descuento_ini_mm=desc_ini, descuento_fin_mm=desc_fin)
         else:
             _line(msp, ax, ay, bx, by, layer=LAYER_CORTE)
 
@@ -432,9 +478,10 @@ def validar_pieza(pieza: dict) -> list[str]:
         if tipo in ("encimera", "isla", "cascada"):
             if ancho in (None, 0):
                 problemas.append("ancho_mm (fondo de la encimera)")
-        elif tipo in ("chapeado", "frontal", "pilastra", "costado"):
+        elif tipo in ("chapeado", "frontal", "pilastra", "costado",
+                      "gama", "dintel", "antepecho"):
             if (alto in (None, 0)) and (ancho in (None, 0)):
-                problemas.append("alto_mm (altura del chapeado)")
+                problemas.append("alto_mm (altura)")
         elif tipo in ("copete", "rodapie", "zocalo", "paso", "tabica"):
             if (alto in (None, 0)) and (ancho in (None, 0)):
                 problemas.append("alto_mm (altura de la tira)")
@@ -513,13 +560,31 @@ def _aplicar_guion(valor: float, pieza: dict, grosor_global: float) -> float:
 
 
 def _dibujar_chapeado(msp, pieza: dict, x: float, y: float, grosor_global: float = 0):
-    """Chapeado / frontal / pilastra / costado (panel vertical). largo × alto."""
+    """Chapeado / frontal / pilastra / costado / gama / dintel / antepecho."""
     if pieza.get("contorno_custom"):
         w, h = _dibujar_contorno_custom(msp, pieza, x, y)
         _dibujar_huecos(msp, pieza.get("huecos", []), x, y, w, h, pieza)
         return w, h
 
     tipo = (pieza.get("tipo") or "").lower()
+
+    # Regla recercados: dintel/antepecho con largo pulido → descontar grosor en extremos
+    # (porque la gama apoya en ese extremo, no se ve, no se pule).
+    grosor_para_descuento = float(pieza.get("grosor_mm") or grosor_global or 0)
+    if tipo in ("dintel", "antepecho") and grosor_para_descuento > 0:
+        acab_dict = pieza.get("acabados_aristas") or {}
+        for edge_name in ("frente", "fondo"):
+            ae = acab_dict.get(edge_name)
+            if isinstance(ae, dict) and (ae.get("tipo") or "").lower() == "pulido":
+                if ae.get("descuento_ini_mm") is None:
+                    ae["descuento_ini_mm"] = grosor_para_descuento
+                if ae.get("descuento_fin_mm") is None:
+                    ae["descuento_fin_mm"] = grosor_para_descuento
+                pieza.setdefault("_defaults_aplicados", []).append(
+                    f"arista '{edge_name}' {tipo}: pulido con descuento {grosor_para_descuento:.0f}mm "
+                    f"en cada extremo (zona cubierta por gama)")
+        pieza["acabados_aristas"] = acab_dict
+
     w = float(pieza["largo_mm"])
 
     # Para costados, 'ancho_mm' es el fondo (lo que se ve en planta) — usar eso
@@ -582,6 +647,64 @@ def _dibujar_tira(msp, pieza: dict, x: float, y: float, grosor_global: float = 0
 
     _rect_con_acabados(msp, x, y, w, h, acabados=_acabados_de_pieza(pieza))
     return w, h
+
+
+def _autoañadir_grifo_fregadero_be(pieza: dict):
+    """
+    Si la pieza tiene fregadero bajo encimera y NO hay grifo, añade uno automático
+    centrado detrás del fregadero a 50mm del borde posterior del hueco.
+    Mutación in-place del dict pieza["huecos"].
+
+    Requiere que el fregadero tenga distancia_frente_mm, ancho_mm y distancia_lado_mm
+    rellenados — si no, no añade nada (habrá FALTA en avisos).
+    """
+    huecos = pieza.get("huecos") or []
+    frgs_be = [h for h in huecos
+               if (h.get("tipo") or "").lower() == "fregadero"
+               and "bajo" in (h.get("subtipo") or "").lower()]
+    grifos = [h for h in huecos if (h.get("tipo") or "").lower() == "grifo"]
+    if not frgs_be or grifos:
+        return  # no hace falta auto-grifo
+
+    defaults_log = pieza.setdefault("_defaults_aplicados", [])
+
+    for frg in frgs_be:
+        df   = frg.get("distancia_frente_mm")
+        ancho_frg = frg.get("ancho_mm")
+        if df is None or not ancho_frg:
+            continue  # faltan datos — no podemos posicionar
+        dl   = frg.get("distancia_lado_mm")
+        pos  = frg.get("posicion")
+
+        radio_grifo = R_GRIFO  # 17.5mm
+        # Grifo centro Y = frente + alto_fregadero + 50 (50mm del borde posterior al centro)
+        grifo_df = float(df) + float(ancho_frg) + 50.0
+
+        grifo = {
+            "tipo": "grifo",
+            "auto_creado": True,
+            "distancia_frente_mm": grifo_df,
+            "posicion": pos,
+            "cantidad": 1,
+            "notas": f"Grifo auto-añadido detrás de fregadero B/E (centrado, 50mm desde borde posterior)",
+        }
+        # Posición horizontal: grifo centrado en la X del fregadero.
+        # Fregadero distancia_lado_mm = al CENTRO del fregadero.
+        # Grifo distancia_lado_mm = al BORDE del taladro (convención grifo/enchufe).
+        # Centro grifo = centro fregadero → borde grifo = centro_fregadero − radio_grifo.
+        if pos and "centro" in pos.lower():
+            pass  # posicion=centro → no hace falta distancia_lado
+        elif dl is not None and pos and ("izq" in pos.lower() or "der" in pos.lower()):
+            grifo["distancia_lado_mm"] = float(dl) - radio_grifo
+        else:
+            # Sin posición clara — centrarlo en la pieza (aproximación)
+            grifo["posicion"] = "centro"
+
+        huecos.append(grifo)
+        defaults_log.append(
+            f"grifo auto-añadido Ø{radio_grifo*2:.0f}mm a 50mm del borde posterior del fregadero — confirmar en obra")
+
+    pieza["huecos"] = huecos
 
 
 def _dibujar_huecos(msp, huecos: list, base_x, base_y, pieza_w, pieza_h, pieza: dict):
@@ -653,6 +776,10 @@ def _dibujar_huecos(msp, huecos: list, base_x, base_y, pieza_w, pieza_h, pieza: 
             # Radios de esquina (opcional)
             r_esq = hueco.get("radio_esquina_mm") or 0
             if r_esq and r_esq > 0 and r_esq < min(hw, hh) / 2:
+                if float(r_esq) < RADIO_MIN_MAQUINA_MM:
+                    defaults_log.append(
+                        f"hueco[{idx}] placa: radio_esquina_mm={r_esq} < 20mm → "
+                        f"esquinas rectas en DXF + marca 'R{int(r_esq)}' para redondeo manual")
                 _hueco_rect_con_radios(msp, hx, hy, hw, hh, radio=float(r_esq))
             else:
                 _hueco_rect(msp, hx, hy, hw, hh)
@@ -725,6 +852,10 @@ def _dibujar_huecos(msp, huecos: list, base_x, base_y, pieza_w, pieza_h, pieza: 
             # Radio de esquina explícito > fallback a keyword "curva" en notas
             r_esq = hueco.get("radio_esquina_mm") or 0
             if r_esq and r_esq > 0 and r_esq < min(hw, hh) / 2:
+                if float(r_esq) < RADIO_MIN_MAQUINA_MM:
+                    defaults_log.append(
+                        f"hueco[{idx}] fregadero: radio_esquina_mm={r_esq} < 20mm → "
+                        f"esquinas rectas en DXF + marca 'R{int(r_esq)}' para redondeo manual")
                 _hueco_rect_con_radios(msp, hx, hy, hw, hh, radio=float(r_esq))
             elif "curva" in (hueco.get("notas") or "").lower():
                 _hueco_fregadero_con_curvas(msp, hx + hw/2, hy + hh/2, hw, hh)
@@ -734,6 +865,9 @@ def _dibujar_huecos(msp, huecos: list, base_x, base_y, pieza_w, pieza_h, pieza: 
 
         if tipo in ("grifo", "enchufe"):
             radio = R_GRIFO if tipo == "grifo" else R_ENCHUFE
+            cantidad   = int(hueco.get("cantidad") or 1)
+            # Default 0: los taladros se tocan tangencialmente (centros a 2*radio)
+            sep_bordes = float(hueco.get("separacion_mm") or 0.0)
             if dist_frente is None:
                 # Default para enchufes en chapeado/frontal: centrado vertical (alto/2)
                 parent_tipo = (pieza.get("tipo") or "").lower()
@@ -743,21 +877,35 @@ def _dibujar_huecos(msp, huecos: list, base_x, base_y, pieza_w, pieza_h, pieza: 
                         f"hueco[{idx}] enchufe en {parent_tipo}: distancia_frente_mm NO en nota → usado alto/2 = {dist_frente:.0f}mm")
                 else:
                     print(f"    ⚠ Hueco {tipo} #{idx} omitido: falta distancia_frente_mm"); continue
-            # Grifo/enchufe son círculos; distancia_lado_mm = al centro del círculo
+
+            # Semántica específica enchufe/grifo: distancia_lado_mm = al BORDE
+            # del taladro más cercano (del grupo si es doble/triple).
+            # Para dibujar: el primer centro queda a distancia_lado + radio.
+            paso = (2 * radio) + sep_bordes  # centro-a-centro entre taladros consecutivos
+
             if "izq" in pos:
                 if dist_lado is None:
                     print(f"    ⚠ Hueco {tipo} #{idx} 'izquierda' omitido: falta distancia_lado_mm"); continue
-                hx = base_x + float(dist_lado)
+                cx0 = base_x + float(dist_lado) + radio  # centro del 1º taladro
             elif "der" in pos:
                 if dist_lado is None:
                     print(f"    ⚠ Hueco {tipo} #{idx} 'derecha' omitido: falta distancia_lado_mm"); continue
-                hx = base_x + pieza_w - float(dist_lado)
+                # dist_lado mide del borde derecho al borde derecho del grupo
+                ancho_grupo = cantidad * (2 * radio) + (cantidad - 1) * sep_bordes
+                cx0 = base_x + pieza_w - float(dist_lado) - ancho_grupo + radio
             elif "centro" in pos:
-                hx = base_x + pieza_w / 2
+                ancho_grupo = cantidad * (2 * radio) + (cantidad - 1) * sep_bordes
+                cx0 = base_x + (pieza_w - ancho_grupo) / 2 + radio
             else:
                 print(f"    ⚠ Hueco {tipo} #{idx} omitido: posicion='{pos}' desconocida"); continue
+
             hy = base_y + float(dist_frente)
-            _circle(msp, hx, hy, radio, layer=LAYER_TALADRO)
+            for k in range(cantidad):
+                _circle(msp, cx0 + k * paso, hy, radio, layer=LAYER_TALADRO)
+            if cantidad > 1:
+                defaults_log.append(
+                    f"hueco[{idx}] {tipo}: cantidad={cantidad} taladros (Ø{radio*2:.0f}mm) "
+                    f"con separación borde-borde {sep_bordes:.0f}mm")
 
         else:
             print(f"    ⚠ Hueco tipo='{tipo}' no reconocido (pieza {pieza.get('tipo')})")
@@ -790,6 +938,10 @@ def generar_dxf(medidas: dict, salida: Path,
     dibujadas = 0
     omitidas  = []
 
+    # Pre-procesado: auto-añadir grifo a fregaderos B/E sin grifo explícito
+    for pieza in piezas:
+        _autoañadir_grifo_fregadero_be(pieza)
+
     for i, pieza in enumerate(piezas):
         problemas = validar_pieza(pieza)
         # Separar problemas bloqueantes (geometría propia) de los no bloqueantes (huecos)
@@ -812,7 +964,8 @@ def generar_dxf(medidas: dict, salida: Path,
         try:
             if tipo in ("encimera", "isla"):
                 _dibujar_encimera(msp, pieza, x, y)
-            elif tipo in ("chapeado", "frontal", "pilastra", "costado"):
+            elif tipo in ("chapeado", "frontal", "pilastra", "costado",
+                          "gama", "dintel", "antepecho"):
                 _dibujar_chapeado(msp, pieza, x, y, grosor_global=grosor_global)
             elif tipo in ("copete", "rodapie", "zocalo", "paso", "tabica"):
                 _dibujar_tira(msp, pieza, x, y, grosor_global=grosor_global)

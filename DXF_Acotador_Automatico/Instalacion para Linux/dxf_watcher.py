@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════╗
-║              DXF WATCHER  v1.0                           ║
+║              DXF WATCHER  v1.1                           ║
 ║  Monitoriza carpetas y genera PDFs automáticamente       ║
 ║  cuando se añade o modifica un archivo .dxf              ║
+║  v1.1: integración con Trello (adjunta PDF a tarjeta)    ║
 ╚══════════════════════════════════════════════════════════╝
 
 Uso:
@@ -11,8 +12,8 @@ Uso:
     python dxf_watcher.py --config mi.json  # config personalizada
     python dxf_watcher.py --scan-now        # escanea primero los DXF sin PDF
 
-Requisito:
-    pip install watchdog
+Requisitos:
+    pip install watchdog numpy matplotlib networkx
 """
 
 import os
@@ -76,7 +77,22 @@ DEFAULT_CONFIG = {
     "log_level": "INFO",
 
     # Python a usar (vacío = el mismo python que ejecuta este script)
-    "python_executable": ""
+    "python_executable": "",
+
+    # Integración con Trello ──────────────────────────────────────────────────
+    # Cómo obtener las credenciales (gratis):
+    #   1. API key  → https://trello.com/power-ups/admin  (crear Power-Up o usar uno existente)
+    #                 En la pestaña "API key" copia la clave.
+    #   2. Token    → https://trello.com/1/authorize?expiration=never&scope=read,write&response_type=token&key=TU_API_KEY
+    #                 Sustituye TU_API_KEY por tu clave y abre la URL en el navegador.
+    "trello": {
+        "enabled": False,
+        "api_key": "",
+        "token": "",
+        "board_name": "Planificador de Trabajo",
+        "min_match_score": 0.3,
+        "cache_minutes": 30
+    }
 }
 
 CONFIG_FILE = "watcher_config.json"
@@ -166,8 +182,8 @@ def pdf_is_current(dxf_path: str) -> bool:
     return pdf_path.stat().st_mtime >= Path(dxf_path).stat().st_mtime
 
 
-def process_dxf(dxf_path: str, config: dict):
-    """Genera el PDF para el archivo DXF dado."""
+def process_dxf(dxf_path: str, config: dict, trello=None):
+    """Genera el PDF para el archivo DXF dado y, si Trello está activo, lo adjunta."""
     dxf_path = str(Path(dxf_path).resolve())
 
     if is_blacklisted(dxf_path, config.get("blacklist", [])):
@@ -198,7 +214,10 @@ def process_dxf(dxf_path: str, config: dict):
         )
         elapsed = time.time() - t0
         if result.returncode == 0:
-            log.info(f"  ✓ PDF generado en {elapsed:.1f}s: {Path(dxf_path).with_suffix('.pdf').name}")
+            pdf_path = str(Path(dxf_path).with_suffix(".pdf"))
+            log.info(f"  ✓ PDF generado en {elapsed:.1f}s: {Path(pdf_path).name}")
+            if trello:
+                trello.upload(dxf_path, pdf_path)
         else:
             # Extraer mensaje de error relevante
             stderr = (result.stderr or "").strip()
@@ -216,7 +235,7 @@ def process_dxf(dxf_path: str, config: dict):
         log.error(f"  ✗ Excepción: {e}")
 
 
-def scan_folder(watch_folder: str, config: dict):
+def scan_folder(watch_folder: str, config: dict, trello=None):
     """Escanea la carpeta y procesa DXF sin PDF o con PDF desactualizado."""
     log.info("── Escaneando carpeta en busca de DXF sin PDF actualizado...")
     count = 0
@@ -228,7 +247,7 @@ def scan_folder(watch_folder: str, config: dict):
         if is_blacklisted(str(dxf_path), config.get("blacklist", [])):
             continue
         if not pdf_is_current(str(dxf_path)):
-            process_dxf(str(dxf_path), config)
+            process_dxf(str(dxf_path), config, trello)
             count += 1
     if count == 0:
         log.info("── Todos los DXF tienen PDF actualizado.")
@@ -241,9 +260,10 @@ def scan_folder(watch_folder: str, config: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DxfEventHandler(FileSystemEventHandler):
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, trello=None):
         super().__init__()
         self.config = config
+        self.trello = trello
         self.debounce = config.get("debounce_seconds", 5)
         self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
@@ -279,7 +299,7 @@ class DxfEventHandler(FileSystemEventHandler):
         if not Path(path).exists():
             log.debug(f"Archivo ya no existe: {path}")
             return
-        process_dxf(path, self.config)
+        process_dxf(path, self.config, self.trello)
 
     def on_created(self, event):
         if not event.is_directory:
@@ -339,21 +359,40 @@ def main():
         sys.exit(1)
 
     log.info("══════════════════════════════════════════════════════════")
-    log.info("  DXF WATCHER  v1.0")
+    log.info("  DXF WATCHER  v1.1")
     log.info(f"  Vigilando : {watch_folder}")
     bl = config.get('blacklist', [])
     log.info(f"  Blacklist  : {', '.join(bl) if bl else '(ninguna)'}")
     log.info(f"  Debounce   : {config.get('debounce_seconds', 5)}s")
     log.info(f"  Python     : {config.get('python_executable') or get_python()}")
+
+    # Inicializar Trello (opcional)
+    trello = None
+    trello_cfg = config.get("trello", {})
+    if trello_cfg.get("enabled", False):
+        try:
+            import trello_uploader
+            trello = trello_uploader.create_from_config(config)
+            if trello:
+                log.info(f"  Trello     : activo (tablero '{trello_cfg.get('board_name', '')}')")
+            else:
+                log.warning("  Trello     : no se pudo conectar (ver mensajes de error arriba)")
+        except ImportError:
+            log.warning("  Trello     : trello_uploader.py no encontrado junto a este script")
+        except Exception as e:
+            log.warning(f"  Trello     : error al inicializar: {e}")
+    else:
+        log.info("  Trello     : desactivado (ver watcher_config.json para activar)")
+
     log.info("  Ctrl+C para detener")
     log.info("══════════════════════════════════════════════════════════")
 
     # Escaneo inicial
     if args.scan_now or config.get("scan_on_start", True):
-        scan_folder(watch_folder, config)
+        scan_folder(watch_folder, config, trello)
 
     # Iniciar observador
-    handler = DxfEventHandler(config)
+    handler = DxfEventHandler(config, trello)
     observer = Observer()
     observer.schedule(handler, watch_folder, recursive=True)
     observer.start()

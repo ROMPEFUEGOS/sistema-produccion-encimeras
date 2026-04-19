@@ -15,7 +15,7 @@ Uso:
     python dxf_auto_dim_v1.3.py archivo.dxf -o resultado.pdf
     python dxf_auto_dim_v1.3.py archivo.dxf -t 5.0
 """
-import os, sys, re, math, argparse, datetime, warnings
+import os, sys, re, math, argparse, datetime, warnings, json
 from pathlib import Path
 import numpy as np
 import matplotlib
@@ -747,7 +747,15 @@ def all_polygons(entities, tol):
 #  DETECCIÓN DE PIEZAS Y HUECOS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_pieces(polygons):
+def build_pieces(polygons, sort_by='area'):
+    """
+    Agrupa polígonos en piezas (outer + holes).
+
+    sort_by:
+      'area'     → mayor área primero (comportamiento histórico)
+      'position' → ordenadas por posición tras identificar outer/holes.
+                   Usado cuando --datos para que el orden coincida con el JSON.
+    """
     if not polygons: return []
     by_area = sorted(polygons, key=poly_area, reverse=True)
     used = [False] * len(by_area)
@@ -765,6 +773,15 @@ def build_pieces(polygons):
             if any(pt_in_poly(cx, cy, h) for h in holes): continue
             holes.append(inner); used[j] = True
         pieces.append({'index': len(pieces)+1, 'outer': outer, 'holes': holes})
+
+    # Si se pide orden por posición, reordenar las piezas finales (izq→der, arriba→abajo)
+    if sort_by == 'position':
+        def piece_sort_key(p):
+            xs, ys = zip(*p['outer'])
+            return (round(min(xs) / 50) * 50, -max(ys))
+        pieces.sort(key=piece_sort_key)
+        for i, p in enumerate(pieces):
+            p['index'] = i + 1
     return pieces
 
 
@@ -1140,10 +1157,137 @@ def draw_corner_angle(ax, corner, prev_pt, next_pt, gap, color=COL_ANGLE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ACABADOS DE ARISTAS  (v1.4)
+#  Detección de líneas en capas CAM especiales (1000INC*, 1007) y generación
+#  de etiquetas "INGLETE {ang}°", "BISEL {ang}°", "PULIDO" sobre las aristas.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Offset usado en dxf_produccion._marcar_pulido para la línea paralela en 1007.
+PULIDO_OFFSET_MM = 15.0
+
+
+def extract_edge_markers(entities):
+    """
+    Extrae LINEs en capas CAM especiales para anotar acabados en el PDF.
+
+    Retorna lista de dicts con:
+      layer, kind ('inglete'|'bisel'|'pulido'), angle (float|None),
+      start (x,y), end (x,y).
+
+    Convenciones:
+      * Layer 1000INC{ang} → corte inclinado del disco. Angle en [40,50] → 'inglete';
+        otros → 'bisel'. El '_' del nombre se interpreta como separador decimal.
+      * Layer 1007 → línea paralela de guía visual: marca arista pulida.
+    """
+    markers = []
+    for e in entities:
+        if e.get('type') != 'LINE':
+            continue
+        layer = e.get('layer', '0')
+        s = (e.get('x1', 0), e.get('y1', 0))
+        t = (e.get('x2', 0), e.get('y2', 0))
+
+        if layer.startswith('1000INC'):
+            suf = layer[len('1000INC'):].replace('_', '.')
+            try:
+                angle = float(suf)
+            except ValueError:
+                continue
+            kind = 'inglete' if 40.0 <= abs(angle) <= 50.0 else 'bisel'
+            markers.append({'layer': layer, 'kind': kind, 'angle': angle,
+                            'start': s, 'end': t})
+        elif layer == '1007':
+            markers.append({'layer': layer, 'kind': 'pulido', 'angle': None,
+                            'start': s, 'end': t})
+    return markers
+
+
+def _match_marker_to_edge(marker, piece_outer, tol_endpoint=2.0,
+                          tol_offset=5.0, tol_parallel=0.95):
+    """
+    Devuelve (edge_start, edge_end) del outer de la pieza que corresponde al
+    marker, o None si no hay match.
+
+    Regla de matching:
+      * 'inglete'/'bisel': mismos extremos (orden indiferente) dentro de tol_endpoint.
+      * 'pulido': línea paralela a una arista a distancia ≈ PULIDO_OFFSET_MM
+        (dentro de tol_offset) con proyección superpuesta al segmento.
+    """
+    n = len(piece_outer)
+    s, e = marker['start'], marker['end']
+
+    if marker['kind'] in ('inglete', 'bisel'):
+        for i in range(n):
+            a = piece_outer[i]
+            b = piece_outer[(i + 1) % n]
+            same = math.dist(a, s) < tol_endpoint and math.dist(b, e) < tol_endpoint
+            rev  = math.dist(a, e) < tol_endpoint and math.dist(b, s) < tol_endpoint
+            if same or rev:
+                return (a, b)
+        return None
+
+    if marker['kind'] == 'pulido':
+        mvx, mvy = e[0] - s[0], e[1] - s[1]
+        mlen = math.hypot(mvx, mvy)
+        if mlen < 1:
+            return None
+        mvx /= mlen; mvy /= mlen
+        mid = ((s[0] + e[0]) / 2, (s[1] + e[1]) / 2)
+
+        best = None; best_d = float('inf')
+        for i in range(n):
+            a = piece_outer[i]
+            b = piece_outer[(i + 1) % n]
+            dx = b[0] - a[0]; dy = b[1] - a[1]
+            elen = math.hypot(dx, dy)
+            if elen < 1: continue
+            evx, evy = dx / elen, dy / elen
+            # Paralelismo (|dot| cerca de 1)
+            dot = abs(evx * mvx + evy * mvy)
+            if dot < tol_parallel:
+                continue
+            # Distancia perpendicular desde mid del marker a la línea del edge
+            nx, ny = -evy, evx
+            perp = abs((mid[0] - a[0]) * nx + (mid[1] - a[1]) * ny)
+            if abs(perp - PULIDO_OFFSET_MM) > tol_offset:
+                continue
+            # Proyección sobre la arista (debe caer dentro del segmento)
+            tproj = (mid[0] - a[0]) * evx + (mid[1] - a[1]) * evy
+            if tproj < -tol_offset or tproj > elen + tol_offset:
+                continue
+            d = abs(perp - PULIDO_OFFSET_MM)
+            if d < best_d:
+                best_d = d; best = (a, b)
+        return best
+
+    return None
+
+
+def draw_edge_finishes(ax, piece, markers, gap):
+    """Dibuja las etiquetas de acabado sobre las aristas correspondientes."""
+    if not markers:
+        return
+    COLORS = {'inglete': '#C62828', 'bisel': '#6A1B9A', 'pulido': '#00838F'}
+    for mk in markers:
+        edge = _match_marker_to_edge(mk, piece['outer'])
+        if edge is None:
+            continue
+        a, b = edge
+        if mk['kind'] == 'inglete':
+            label = f"INGLETE {mk['angle']:.1f}°"
+        elif mk['kind'] == 'bisel':
+            label = f"BISEL {abs(mk['angle']):.1f}°"
+        else:
+            label = "PULIDO"
+        draw_edge_label(ax, a, b, label, color=COLORS[mk['kind']], fs=7.2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  RENDER — PÁGINA DE PIEZA  (v1.3)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm'):
+def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm',
+                      edge_markers=None, pieza_json=None):
     fig, ax = plt.subplots(figsize=(11.69, 8.27))  # A4 apaisado
 
     gap = compute_dim_gap(m['width'], m['height'])
@@ -1210,6 +1354,9 @@ def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm'
     # ── COTAS PRINCIPALES: cadenas horizontales y verticales ──────────────────
     draw_chain_dims_h(ax, chain_ref_pts, m['miny'], gap, units, COL_DIM)
     draw_chain_dims_v(ax, chain_ref_pts, m['maxx'], gap, units, COL_DIM)
+
+    # ── ACABADOS CAM (inglete / bisel / pulido) ──────────────────────────────
+    draw_edge_finishes(ax, piece, edge_markers, gap)
 
     # ── ARISTAS DIAGONALES: longitud + ángulo ─────────────────────────────────
     for e in edges:
@@ -1309,6 +1456,17 @@ def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm'
         legend_items.append(mpatches.Patch(color=COL_DIST,  label='Dist. a bordes (4 lados)'))
     if m['descuadro']:
         legend_items.append(mpatches.Patch(color=COL_DSQR,  label='Descuadros'))
+    # Acabados presentes en esta pieza
+    kinds_presentes = set()
+    for mk in (edge_markers or []):
+        if _match_marker_to_edge(mk, piece['outer']) is not None:
+            kinds_presentes.add(mk['kind'])
+    if 'inglete' in kinds_presentes:
+        legend_items.append(mpatches.Patch(color='#C62828', label='Inglete (CAM disco inclinado)'))
+    if 'bisel'   in kinds_presentes:
+        legend_items.append(mpatches.Patch(color='#6A1B9A', label='Bisel (CAM disco inclinado)'))
+    if 'pulido'  in kinds_presentes:
+        legend_items.append(mpatches.Patch(color='#00838F', label='Pulido (post-proceso manual)'))
     ax.legend(handles=legend_items, loc='lower right',
               fontsize=6.0, framealpha=0.92)
 
@@ -1334,6 +1492,37 @@ def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm'
             bbox=dict(boxstyle='round,pad=0.3', fc='#FFFDE7', ec='#CCAA00', lw=0.8))
     ax.text(1.0, -0.06, f"Pág. {page_num} / {total_pages}",
             transform=ax.transAxes, ha='right', va='top', fontsize=7, color='#666666')
+
+    # ── Defaults aplicados por falta de medida en la nota (prominente) ────────
+    if pieza_json and pieza_json.get("_defaults_aplicados"):
+        defaults = pieza_json["_defaults_aplicados"]
+        aviso = "⚠ MEDIDA(S) ESTÁNDAR APLICADAS POR FALTA DE DATO EN LA NOTA — CONFIRMAR EN OBRA:\n"
+        aviso += "\n".join(f"  • {d}" for d in defaults)
+        ax.text(0.5, -0.11, aviso, transform=ax.transAxes,
+                ha='center', va='top', fontsize=7.0, wrap=True,
+                color='#b71c1c', fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.5', fc='#FFEBEE',
+                          ec='#b71c1c', lw=1.2))
+
+    # ── Bloque comentarios específicos de la pieza (si hay datos JSON) ────────
+    if pieza_json:
+        notas    = (pieza_json.get("notas") or "").strip()
+        razonami = (pieza_json.get("razonamiento") or "").strip()
+        anot_ids = pieza_json.get("anotaciones_ids") or []
+        bloques = []
+        if notas:    bloques.append(f"📌 Notas: {notas}")
+        if razonami: bloques.append(f"🧠 Razonamiento: {razonami}")
+        if anot_ids: bloques.append(f"📍 Anotaciones fuente: {', '.join('A'+str(i) for i in anot_ids)}")
+        if bloques:
+            texto = " ║ ".join(bloques)
+            if len(texto) > 1500: texto = texto[:1490] + "…"
+            # Si hay defaults el texto sube un poco para no solaparse
+            y_offset = -0.22 if pieza_json.get("_defaults_aplicados") else -0.14
+            ax.text(0.5, y_offset, texto, transform=ax.transAxes,
+                    ha='center', va='top', fontsize=6.8, wrap=True,
+                    color='#4a148c',
+                    bbox=dict(boxstyle='round,pad=0.4', fc='#F3E5F5',
+                              ec='#6A1B9A', lw=0.5))
 
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches='tight')
@@ -1489,6 +1678,237 @@ def resolve_output_path(input_path, output_arg=None):
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  PÁGINAS DE ANOTACIONES (v1.4) — cuando se pasa --datos JSON
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _crop_anotacion(imagenes_dir, imagen_name, bbox_norm):
+    """Devuelve un array numpy del crop, o None si falla."""
+    try:
+        from PIL import Image, ImageOps
+        p = Path(imagenes_dir) / imagen_name
+        if not p.exists(): return None
+        img = Image.open(p)
+        try: img = ImageOps.exif_transpose(img)
+        except Exception: pass
+        img = img.convert("RGB")
+        W, H = img.size
+        x1, y1, x2, y2 = bbox_norm
+        px1 = max(0, int(x1*W)); py1 = max(0, int(y1*H))
+        px2 = min(W, int(x2*W)); py2 = min(H, int(y2*H))
+        if px2 <= px1+2 or py2 <= py1+2: return None
+        crop = img.crop((px1, py1, px2, py2))
+        max_side = 600
+        if max(crop.size) > max_side:
+            ratio = max_side / max(crop.size)
+            crop = crop.resize((int(crop.size[0]*ratio), int(crop.size[1]*ratio)),
+                               Image.LANCZOS)
+        import numpy as _np
+        return _np.array(crop)
+    except Exception as e:
+        print(f"    ⚠ Error cargando crop de {imagen_name}: {e}")
+        return None
+
+
+def render_global_annotations_page(datos, imagenes_dir, pdf):
+    """
+    Hoja 2: anotaciones globales de la nota (las contextuales) + espacio para
+    comentarios Trello (pendiente de integración).
+    """
+    anotaciones = datos.get("anotaciones", []) or []
+    contextuales_ids = set(datos.get("anotaciones_contextuales_ids", []) or [])
+    globales = [a for a in anotaciones if a.get("id") in contextuales_ids]
+
+    razonamiento = datos.get("razonamiento_global", "") or ""
+    cliente  = datos.get("cliente", "") or ""
+    material = datos.get("material", "") or ""
+    numero   = datos.get("numero", "") or ""
+
+    fig = plt.figure(figsize=(11.69, 8.27))
+    fig.suptitle(f"📝 Anotaciones globales y contexto   —   {numero}",
+                 fontsize=13, fontweight='bold', y=0.97)
+
+    # Cabecera con razonamiento global
+    ax_head = fig.add_axes([0.04, 0.78, 0.92, 0.15])
+    ax_head.axis('off')
+    head_text = (f"Cliente: {cliente}    |    Material: {material}\n\n"
+                 f"Análisis general del sintetizador:\n{razonamiento}")
+    ax_head.text(0.01, 0.95, head_text, transform=ax_head.transAxes,
+                 ha='left', va='top', fontsize=8.5, wrap=True,
+                 bbox=dict(boxstyle='round,pad=0.6', fc='#E3F2FD',
+                           ec='#1565C0', lw=0.8))
+
+    # Grid de anotaciones contextuales
+    if globales:
+        n = len(globales)
+        cols = min(3, n)
+        rows = (n + cols - 1) // cols
+        ax_grid_x0 = 0.04
+        ax_grid_y0 = 0.08
+        ax_grid_w  = 0.92
+        ax_grid_h  = 0.66
+        cell_w = ax_grid_w / cols
+        cell_h = ax_grid_h / rows
+        for i, a in enumerate(globales):
+            c = i % cols
+            r = i // cols
+            x0 = ax_grid_x0 + c * cell_w
+            y0 = ax_grid_y0 + (rows - 1 - r) * cell_h
+            # Imagen
+            ax_img = fig.add_axes([x0 + cell_w*0.04, y0 + cell_h*0.45,
+                                    cell_w*0.92, cell_h*0.50])
+            ax_img.axis('off')
+            arr = _crop_anotacion(imagenes_dir, a.get("imagen"), a.get("bbox_norm") or [0,0,1,1])
+            if arr is not None:
+                ax_img.imshow(arr)
+            ax_img.set_title(f"A{a.get('id')}", fontsize=9, fontweight='bold',
+                             color='#E65100', pad=2)
+            # Texto
+            ax_txt = fig.add_axes([x0 + cell_w*0.04, y0 + cell_h*0.05,
+                                    cell_w*0.92, cell_h*0.38])
+            ax_txt.axis('off')
+            desc = (a.get("descripcion") or "").strip()
+            if len(desc) > 350: desc = desc[:340] + "…"
+            ax_txt.text(0, 1, desc, transform=ax_txt.transAxes,
+                        ha='left', va='top', fontsize=7.5, wrap=True,
+                        bbox=dict(boxstyle='round,pad=0.3', fc='#FFF3E0',
+                                  ec='#E65100', lw=0.5))
+    else:
+        ax_msg = fig.add_axes([0.04, 0.08, 0.92, 0.66])
+        ax_msg.axis('off')
+        ax_msg.text(0.5, 0.5, "(Sin anotaciones contextuales detectadas)",
+                    transform=ax_msg.transAxes, ha='center', va='center',
+                    fontsize=11, color='#999')
+
+    # Placeholder comentarios Trello
+    ax_foot = fig.add_axes([0.04, 0.01, 0.92, 0.05])
+    ax_foot.axis('off')
+    ax_foot.text(0.5, 0.5, "[ Comentarios de Trello — pendiente de integración ]",
+                 transform=ax_foot.transAxes, ha='center', va='center',
+                 fontsize=8, color='#666',
+                 bbox=dict(boxstyle='round,pad=0.3', fc='#F5F5F5', ec='#CCC', lw=0.5))
+
+    pdf.savefig(fig, bbox_inches='tight')
+    plt.close(fig)
+
+
+def render_piece_notes_block(ax_parent_fig, pieza_json, anotaciones_dict,
+                              imagenes_dir, x0, y0, w, h):
+    """
+    Dibuja un bloque en una figura existente con las notas/razonamiento y los
+    crops de las anotaciones que sustentan esta pieza.
+    """
+    if not pieza_json:
+        return
+    fig = ax_parent_fig
+    notas       = (pieza_json.get("notas") or "").strip()
+    razonami    = (pieza_json.get("razonamiento") or "").strip()
+    anot_ids    = pieza_json.get("anotaciones_ids") or []
+    anots_de_pieza = [anotaciones_dict[i] for i in anot_ids if i in anotaciones_dict]
+
+    # Sección texto (notas + razonamiento)
+    ax_txt = fig.add_axes([x0, y0 + h*0.55, w, h*0.40])
+    ax_txt.axis('off')
+    parts = []
+    if notas:    parts.append(f"📌 Notas: {notas}")
+    if razonami: parts.append(f"🧠 Razonamiento: {razonami}")
+    texto = "\n\n".join(parts) if parts else "(Sin notas)"
+    if len(texto) > 1000: texto = texto[:990] + "…"
+    ax_txt.text(0.01, 0.98, texto, transform=ax_txt.transAxes,
+                ha='left', va='top', fontsize=7, wrap=True,
+                bbox=dict(boxstyle='round,pad=0.4', fc='#F3E5F5',
+                          ec='#6A1B9A', lw=0.5))
+
+    # Fila de crops pequeños de las anotaciones que sustentan
+    if anots_de_pieza:
+        n = min(len(anots_de_pieza), 5)
+        cell_w = w / n
+        for i, a in enumerate(anots_de_pieza[:n]):
+            ax_c = fig.add_axes([x0 + i*cell_w + cell_w*0.05, y0,
+                                  cell_w*0.90, h*0.48])
+            ax_c.axis('off')
+            arr = _crop_anotacion(imagenes_dir, a.get("imagen"),
+                                  a.get("bbox_norm") or [0,0,1,1])
+            if arr is not None:
+                ax_c.imshow(arr)
+            ax_c.set_title(f"A{a.get('id')}", fontsize=6.5, pad=1, color='#E65100')
+
+
+def render_final_summary_page(datos, pieces_data, pdf, units='mm'):
+    """Página final con resumen agregado de la obra + correcciones aplicadas."""
+    fig = plt.figure(figsize=(11.69, 8.27))
+    fig.suptitle(f"📋 Resumen final de la obra   —   {datos.get('numero','')}",
+                 fontsize=13, fontweight='bold', y=0.97)
+
+    ax = fig.add_axes([0.05, 0.05, 0.90, 0.87])
+    ax.axis('off')
+
+    piezas = datos.get("piezas", []) or []
+    correcciones = datos.get("correcciones_historial", []) or []
+    piezas_con_defaults = [(i+1, p.get("tipo"), p.get("_defaults_aplicados"))
+                            for i, p in enumerate(piezas)
+                            if p.get("_defaults_aplicados")]
+
+    # Agregar por tipo
+    from collections import Counter
+    tipos = Counter((p.get("tipo") or "?") for p in piezas)
+
+    # Totales CAM por capa (aprox: contar aristas con inglete/pulido/bisel)
+    n_inglete = n_bisel = n_pulido = 0
+    for p in piezas:
+        # acabados_aristas (rectangular)
+        for a in (p.get("acabados_aristas") or {}).values():
+            if not a: continue
+            t = (a.get("tipo") or "").lower() if isinstance(a, dict) else ""
+            if t == "inglete": n_inglete += 1
+            elif t == "bisel": n_bisel += 1
+            elif t == "pulido": n_pulido += 1
+        # acabados_contorno (custom)
+        for a in ((p.get("contorno_custom") or {}).get("acabados_contorno") or []):
+            if not a: continue
+            t = (a.get("tipo") or "").lower() if isinstance(a, dict) else ""
+            if t == "inglete": n_inglete += 1
+            elif t == "bisel": n_bisel += 1
+            elif t == "pulido": n_pulido += 1
+
+    txt = []
+    txt.append(f"Cliente: {datos.get('cliente','?')}")
+    txt.append(f"Material: {datos.get('material','?')}")
+    txt.append(f"Número: {datos.get('numero','?')}")
+    txt.append("")
+    txt.append(f"Total piezas: {len(piezas)}")
+    for tipo, n in sorted(tipos.items(), key=lambda kv: -kv[1]):
+        txt.append(f"   · {tipo}: {n}")
+    txt.append("")
+    txt.append(f"Acabados totales:")
+    txt.append(f"   · Ingletes: {n_inglete} aristas")
+    txt.append(f"   · Biseles:  {n_bisel} aristas")
+    txt.append(f"   · Pulidos:  {n_pulido} aristas")
+    txt.append("")
+    if datos.get("ultima_sintesis"):
+        txt.append(f"Última síntesis: {datos['ultima_sintesis']}")
+    if piezas_con_defaults:
+        txt.append(f"\n⚠ Piezas con MEDIDAS ESTÁNDAR aplicadas (confirmar en obra): {len(piezas_con_defaults)}")
+        for i, tipo, defs in piezas_con_defaults:
+            txt.append(f"   · Pieza #{i} ({tipo}):")
+            for d in defs:
+                txt.append(f"       - {d}")
+    if correcciones:
+        txt.append(f"\nCorrecciones aplicadas: {len(correcciones)}")
+        for c in correcciones[-5:]:
+            ts = c.get("timestamp","")
+            cor = (c.get("correccion","") or "")[:120]
+            txt.append(f"   [{ts}] {cor}")
+
+    ax.text(0.02, 0.98, "\n".join(txt), transform=ax.transAxes,
+            ha='left', va='top', fontsize=9.5, fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.8', fc='#E8F5E9',
+                      ec='#1B5E20', lw=1.0))
+
+    pdf.savefig(fig, bbox_inches='tight')
+    plt.close(fig)
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description='DXF Auto-Dimensioner v1.3 → PDF con acotaciones completas')
@@ -1497,6 +1917,13 @@ def parse_args():
     p.add_argument('-t', '--tolerance', type=float, default=None)
     p.add_argument('-m', '--min-area',  type=float, default=MIN_AREA)
     p.add_argument('-v', '--verbose',   action='store_true')
+    p.add_argument('-d', '--datos', default=None,
+                   help='JSON con piezas/anotaciones/razonamiento (medidas_corregidas.json). '
+                        'Si se provee, añade hoja 2 de anotaciones globales + comentarios '
+                        'por pieza + resumen final.')
+    p.add_argument('--imagenes-dir', default=None,
+                   help='Carpeta donde están las imágenes originales de las anotaciones '
+                        '(por defecto junto al JSON en ./imagenes/)')
     return p.parse_args()
 
 
@@ -1542,12 +1969,57 @@ def main():
     polygons = all_polygons(entities, tol)
     print(f"  Polígonos cerrados: {len(polygons)}")
 
+    # Marcadores de acabados CAM (inglete/bisel/pulido). Se snapean igual que
+    # los polígonos para que los extremos coincidan durante el matching.
+    edge_markers_raw = extract_edge_markers(entities)
+    edge_markers = [
+        {**mk,
+         'start': snap(mk['start'][0], mk['start'][1], tol),
+         'end':   snap(mk['end'][0],   mk['end'][1],   tol)}
+        for mk in edge_markers_raw
+    ]
+    if edge_markers:
+        kinds_count = {}
+        for mk in edge_markers:
+            kinds_count[mk['kind']] = kinds_count.get(mk['kind'], 0) + 1
+        resumen = ', '.join(f'{k}={v}' for k, v in sorted(kinds_count.items()))
+        print(f"  Acabados CAM detectados: {len(edge_markers)} ({resumen})")
+
     if not polygons:
         print(f"\n✗ No se detectaron polígonos. Prueba: -t {tol*3:.1f}")
         sys.exit(1)
 
+    # Si se provee --datos JSON, cargar piezas/anotaciones para enriquecer el PDF
+    datos = None
+    piezas_json = []
+    anotaciones_dict = {}
+    imagenes_dir = None
+    if args.datos:
+        try:
+            with open(args.datos, encoding='utf-8') as f:
+                datos = json.load(f)
+            piezas_json_all = datos.get("piezas", []) or []
+            anots = datos.get("anotaciones", []) or []
+            anotaciones_dict = {a.get("id"): a for a in anots if a.get("id") is not None}
+            imagenes_dir = Path(args.imagenes_dir) if args.imagenes_dir else Path(args.datos).parent / "imagenes"
+
+            # Filtrar piezas_json a las que realmente habrán sido dibujadas en el DXF
+            # (el dibujador salta piezas sin dimensiones). Mantiene el orden.
+            def _tiene_geom(p):
+                cc = p.get("contorno_custom")
+                if cc and isinstance(cc.get("vertices_mm"), list) and len(cc["vertices_mm"]) >= 3:
+                    return True
+                if not p.get("largo_mm"): return False
+                return bool(p.get("ancho_mm") or p.get("alto_mm"))
+            piezas_json = [p for p in piezas_json_all if _tiene_geom(p)]
+            print(f"  Datos JSON cargados: {len(piezas_json_all)} piezas ({len(piezas_json)} con geometría), {len(anots)} anotaciones")
+            print(f"  Imágenes: {imagenes_dir}")
+        except Exception as ex:
+            print(f"  ⚠ No se pudo leer --datos {args.datos}: {ex}")
+            datos = None
+
     print("→ Detectando piezas y huecos...")
-    pieces = build_pieces(polygons)
+    pieces = build_pieces(polygons, sort_by='position' if datos else 'area')
     print(f"  Piezas: {len(pieces)}")
     for p in pieces:
         a = poly_area(p['outer'])
@@ -1574,20 +2046,35 @@ def main():
               + (f"  ⊠ [{dq}]" if dq else ''))
         pieces_data.append({'piece': p, 'measurements': m})
 
-    total_pgs = len(pieces) + 1
+    # Páginas: 1 portada + (1 globales si datos) + N piezas + (1 resumen final si datos)
+    extra = 2 if datos else 0
+    total_pgs = len(pieces) + 1 + extra
     print(f"\n→ Generando PDF ({total_pgs} páginas)...")
 
     try:
         with PdfPages(out) as pdf:
             render_summary_page(pieces_data, dxf_in, pdf, tol_used=tol, units=units)
             print("  ✓ Portada/resumen")
+
+            if datos:
+                render_global_annotations_page(datos, imagenes_dir, pdf)
+                print("  ✓ Hoja 2: anotaciones globales")
+
             for i, pd in enumerate(pieces_data):
+                pj = piezas_json[i] if i < len(piezas_json) else None
+                page_num = i + 2 + (1 if datos else 0)
                 render_piece_page(
                     pd['piece'], pd['measurements'], pdf,
                     Path(dxf_in).name,
-                    page_num=i+2, total_pages=total_pgs,
-                    units=units)
-                print(f"  ✓ Pieza #{pd['piece']['index']}")
+                    page_num=page_num, total_pages=total_pgs,
+                    units=units,
+                    edge_markers=edge_markers,
+                    pieza_json=pj)
+                print(f"  ✓ Pieza #{pd['piece']['index']}" + (f" (json: {pj.get('tipo')})" if pj else ""))
+
+            if datos:
+                render_final_summary_page(datos, pieces_data, pdf, units=units)
+                print("  ✓ Resumen final de la obra")
     except Exception as ex:
         print(f"\n✗ Error generando PDF: {ex}")
         import traceback; traceback.print_exc()

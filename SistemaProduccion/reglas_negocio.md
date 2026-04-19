@@ -30,28 +30,53 @@ del taller. El código dibuja ese default y lo reporta en el PDF como
 Esta convención SOLO aplica a copetes. Rodapiés, zócalos, chapeados y demás tiras
 requieren la altura explícita de la nota; si falta, `alto_mm = null` + "FALTA".
 
-## Convención "largo pulido" (copetes, rodapiés, zócalos, chapeados, tiras)
+## ⚠ Convenciones de pulido por tipo de pieza (REGLA CRÍTICA)
 
-Cuando la nota dice **"largo pulido"** o **"LP"** junto a una pieza tipo tira (copete,
-rodapié, zócalo, chapeado, frontal), significa que **el LARGO SUPERIOR va pulido**
-(`acabados_aristas.fondo.tipo = "pulido"`).
+Hay DOS capas de reglas que funcionan en conjunto:
 
-**Por defecto**: los copetes SIEMPRE llevan "largo pulido" — emite el pulido del
-fondo aunque la nota no lo indique explícitamente (es la convención del taller).
-Lo mismo aplica por defecto a rodapiés SOLO si la nota los marca "LP" (no hay
-convención universal para rodapiés).
+### (A) Marcadores explícitos de la nota — SIEMPRE se respetan
 
-**Las cabezas** (cabeza_izq, cabeza_der) NO se pulen por defecto en copetes/rodapiés.
-Se pulen SOLO cuando:
-- La nota marca una **"X"** sobre la arista de cabeza, o
-- Escribe explícitamente "CI" (cabeza izq pulida) / "CD" (cabeza der pulida), o
-- Dice "cabeza pulida" explícito.
+Cuando la nota marca una arista específica como pulida, **SIEMPRE aplica** el
+pulido en esa arista, independientemente del tipo de pieza (encimera, rodapié,
+copete, chapeado, etc.). Los marcadores posibles son:
 
-**El largo inferior (frente) normalmente NO se pule** en copetes/rodapiés. Solo
-si hay una X dibujada en el largo inferior.
+| Marcador en la nota | Significado |
+|---------------------|-------------|
+| **X sobre una línea** | Esa arista del rectángulo va pulida |
+| **CI** | Cabeza Izquierda pulida |
+| **CD** | Cabeza Derecha pulida |
+| **CP** | Cabeza Pulida (identificar cuál por contexto/posición en la nota). **Aplica solo a UNA cabeza, NO al largo.** |
+| **LP** | Largo Pulido (suele referirse al largo superior, fondo) |
+| **X pequeña + número** junto a arista | Arista pulida parcialmente con `extension_mm` indicada |
 
-**En chapeados/frontales** esta convención NO aplica por defecto — respeta solo
-lo que marque la nota explícitamente con X o texto.
+Estos marcadores SIEMPRE ganan. No importa si la pieza es rodapié o encimera.
+
+### (B) Defaults por tipo cuando la nota NO marca nada
+
+Si la nota NO menciona ni marca nada sobre el pulido de una pieza, aplican estos
+defaults:
+
+| Tipo pieza | `fondo` (largo sup.) | `frente` (largo inf.) | `cabeza_izq` / `cabeza_der` |
+|------------|----------------------|------------------------|------------------------------|
+| **copete**  | **SÍ pulido** (convención taller) | NO | NO |
+| **rodapié** | NO | NO | NO |
+| **zócalo**  | NO | NO | NO |
+| **chapeado / frontal** | NO | NO | NO |
+| **encimera** (pegada a pared) | NO (fondo = pared) | SÍ (frente visible de la cocina) | NO |
+| **isla** (sin pared) | SÍ (perímetro visible) | SÍ | SÍ |
+| **costado / cascada** | SÍ | — | SÍ |
+
+### Errores frecuentes a NO repetir
+
+- ❌ Poner `fondo=pulido` a TODOS los rodapiés "por si acaso" — incorrecto si la
+  nota no marca "LP" en ese rodapié.
+- ❌ **Ignorar un marcador "CP" o "CI/CD" en un rodapié** porque "los rodapiés no
+  se pulen" — incorrecto. La capa (A) gana sobre la (B). Si la nota marca CP,
+  **esa cabeza va pulida**, aunque sea rodapié.
+- ❌ Interpretar "CP" como "largo pulido también" — NO. "CP" solo marca UNA cabeza.
+- ❌ Confundir copete y rodapié: **copete** va arriba en la pared (largo superior
+  se pule por default); **rodapié** va abajo al suelo (no se pule nada por
+  default — solo lo que marque la nota).
 
 ## Acabados de aristas
 
@@ -118,17 +143,101 @@ descuadro_der_mm`. Si la nota da frente Y fondo, comprueba que los descuadros cu
 **Ejemplo T4070 encimera**: frente 2210, fondo 2205 → cabeza der 5mm más corta arriba
 → `descuadro_der_mm: -5`. **NO** `+5`.
 
+## Recercados de ventanas/puertas (G, D, AP)
+
+Abreviaturas de la nota manuscrita para piezas que forman un **recercado** de
+ventana o puerta:
+
+| Abreviatura | Nombre | Qué es |
+|-------------|--------|--------|
+| **G** | Gama | Pieza LATERAL del recercado (vertical, en los lados de la abertura). Suelen ir 2 (izquierda y derecha). |
+| **D** | Dintel | Pieza SUPERIOR del recercado (horizontal, arriba de la abertura). Normalmente 1 sola. |
+| **AP** | Antepecho | Pieza INFERIOR del recercado (horizontal, abajo de la abertura — sólo en ventanas, no en puertas). Normalmente 1 sola. |
+
+Cada pieza de recercado es un rectángulo plano. En el schema usa `tipo`:
+  - `gama`
+  - `dintel`
+  - `antepecho`
+
+El sintetizador debe tratarlas como piezas tipo "chapeado" para el dibujo
+(largo × alto con acabados por arista).
+
+### Convención de cantidad (95% de los casos)
+
+- **Gamas**: aunque la nota solo dé UNA medida de gama, **emite 2 piezas iguales**.
+  - Son simétricas (una a la izquierda, otra a la derecha de la abertura).
+  - Mismos largo/alto.
+  - El pulido suele ir en la arista "interior" — una frente a la otra. Si la nota
+    no marca de qué lado, emítelo en `cabeza_der` de la gama izquierda y en
+    `cabeza_izq` de la gama derecha (se enfrentan al montar).
+  - Si la nota da 2 medidas distintas, emítelas tal cual (no todas las ventanas
+    son simétricas).
+- **Dintel**: 1 sola pieza.
+- **Antepecho**: 1 sola pieza si es ventana; 0 si es puerta.
+
+### Convención de pulido en recercados (por defecto)
+
+Los **largos (frente y fondo)** de TODAS las piezas de recercado van pulidos por
+defecto (son las caras visibles en obra).
+
+- **Gama**: `frente=pulido` + `fondo=pulido` + UNA cabeza pulida (la interior).
+- **Dintel** y **antepecho**: `frente=pulido` + `fondo=pulido`. Las **cabezas
+  NO se pulen**. Además, los largos tienen **descuento en los extremos**
+  equivalente al grosor del material (= 2cm si material 20mm, = 3cm si 30mm):
+  esa zona queda cubierta por la gama que apoya/ensambla ahí y no se pule.
+
+El código DXF aplica automáticamente ese descuento (`descuento_ini_mm =
+grosor_mm` y `descuento_fin_mm = grosor_mm`) en los largos del dintel/antepecho
+cuando emites `tipo: "pulido"`. No hace falta que Claude lo calcule — solo
+que emita la arista como pulida; el código se encarga de acortar el tramo.
+
+### Ejemplo
+
+Nota dice: "G 1450×180, D 1200×180, AP 1200×180".
+
+Emite 4 piezas:
+- gama izq: 1450×180, cabeza_der pulida (arista interior)
+- gama der: 1450×180, cabeza_izq pulida (arista interior)
+- dintel:   1200×180, frente pulido (cara visible hacia la abertura)
+- antepecho: 1200×180, frente pulido
+
+## Grifo automático detrás de fregadero bajo encimera
+
+Si una pieza tiene un fregadero **bajo encimera** y la nota NO menciona un hueco
+de grifo, el código añade automáticamente un grifo con estas especificaciones:
+
+- Ø 35mm (radio 17.5) en la capa `1006` (taladros)
+- **Centrado horizontalmente** respecto al hueco del fregadero
+- **50mm detrás** del fregadero: distancia desde el **borde posterior del hueco
+  del fregadero** hasta el **centro del grifo**
+
+El auto-grifo queda anotado en `_defaults_aplicados` con el aviso
+"grifo auto-añadido a X mm del fregadero — confirmar en obra". Si la nota sí
+marca un grifo explícito (con medidas propias), se respeta el de la nota y
+NO se añade el automático.
+
 ## ⚠ Semántica de distancias de huecos (convención plano cocina)
 
 - `distancia_frente_mm`: del **frente de la pieza** al **borde más cercano** del hueco.
   (Así aparece en los planos: "a X mm del frente" significa desde el borde frente
   de la encimera hasta donde EMPIEZA el hueco.)
-- `distancia_lado_mm`: del **lado** (izq o der, según `posicion`) al **CENTRO** del
-  hueco. Convención estándar en planos de cocina: "la placa a 450mm de la cabeza
-  izq" = el CENTRO de la placa queda a 450mm desde la cabeza izq.
-- `radio_esquina_mm`: radio de redondeo en las 4 esquinas del hueco (para fregaderos
-  suele ser 50-60mm; para placas 5-10mm). Si > 0, las esquinas se dibujan con arcos
-  en capa `0-CON` (fresado).
+- `distancia_lado_mm`: diferente según el tipo de hueco:
+  * **Placa / fregadero**: del lado de la pieza al **CENTRO** del hueco
+    (convención plano cocina: "la placa a 450mm de la cabeza izq" = centro a 450mm)
+  * **Enchufe / grifo / doble-enchufe**: del lado de la pieza al **BORDE** del
+    taladro más cercano (del grupo de taladros si es doble/triple).
+- `cantidad`: para enchufe/grifo, número de taladros consecutivos (default 1).
+  Un "enchufe doble" → cantidad=2 (dos taladros Ø70mm tangentes); "triple" → 3.
+- `separacion_mm`: distancia BORDE-BORDE entre taladros consecutivos del grupo.
+  **Default 0** — los taladros se tocan tangencialmente (el final de uno es el
+  inicio del siguiente). Solo rellenar si la nota indica una separación mayor.
+- `radio_esquina_mm`: radio de redondeo en las 4 esquinas del hueco.
+  - Si **≥ 20mm** (típico fregadero 50-60mm): las esquinas se dibujan con arcos
+    en capa `0-CON` (fresado automático por la máquina).
+  - Si **< 20mm** (típico placa 5-10mm): el DXF se dibuja con **esquinas rectas**
+    (rectángulo plano, sin arcos) pero el código añade un TEXT "R{n}" en cada
+    esquina (capa DEFPOINTS, no mecaniza) y el PDF muestra "esquinas R{n}" en
+    la lista de avisos. El operario redondea a mano con amoladora tras el corte.
 
 ## ⚠ Huecos múltiples en la misma pieza — posiciones distintas obligatorias
 

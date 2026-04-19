@@ -1,0 +1,93 @@
+================================================================
+  DXF ACOTADOR AUTOMÁTICO — Instalación Windows
+================================================================
+
+QUÉ HACE ESTE PROGRAMA
+----------------------
+1. Vigila la carpeta Z:\TRABAJOS_DXF (o la que configures)
+2. Cuando alguien guarda o modifica un archivo .dxf, automáticamente:
+   a) Lee el DXF
+   b) Genera un PDF acotado con todas las cotas, diagonales, radios,
+      huecos, descuadros, ingletes, pulidos, avisos de medidas estándar
+   c) Sube ese PDF a la tarjeta de Trello correspondiente
+   d) Sigue vigilando sin que tengas que hacer nada
+
+================================================================
+  INSTALACIÓN EN 4 PASOS
+================================================================
+
+PASO 1 — COPIAR
+  Copia TODA esta carpeta al PC del taller (ej: C:\DXF_Acotador\)
+
+PASO 2 — EDITAR watcher_config.json
+  Ábrelo con Notepad y cambia:
+    - "watch_folder" → la ruta donde se guardan los DXF
+        Ejemplo: "Z:\\TRABAJOS_DXF"
+        (Ojo: usa \\ en vez de \ en Windows)
+    - "api_key" → tu API key de Trello
+    - "token"   → tu token de Trello
+
+  Si no quieres subir a Trello, pon "enabled": false en la sección trello.
+
+PASO 3 — PRIMER LANZAMIENTO
+  Doble clic en INICIAR_DXF_ACOTADOR.bat
+    - Si no tienes Python instalado, aparece una ventana con un botón
+      "Instalar automáticamente" — pulsa y espera ~2-3 minutos.
+    - Cuando todo esté en verde, pulsa "Iniciar DXF Watcher".
+    - El watcher se lanza en una ventana minimizada que se queda vigilando.
+
+PASO 4 (opcional) — ARRANQUE CON WINDOWS
+  Doble clic en instalar_inicio_automatico.bat
+    - Añade el watcher al arranque de Windows
+    - A partir del siguiente reinicio, el watcher arranca solo
+
+================================================================
+  ARCHIVOS INCLUIDOS
+================================================================
+
+  INICIAR_DXF_ACOTADOR.bat    ← Lanzador principal (primer uso)
+  iniciar_watcher.bat          ← Lanzador sin comprobaciones
+  instalar_inicio_automatico.bat ← Añade al arranque Windows
+  dxf_watcher.py               ← Vigilante de la carpeta
+  dxf_auto_dim_v1.3.py         ← Motor que genera el PDF acotado
+  trello_uploader.py           ← Subida de PDFs a Trello
+  watcher_config.json          ← Configuración (editar antes)
+  README.md                    ← Referencia técnica
+  INSTRUCCIONES.txt            ← Este archivo
+
+================================================================
+  VERIFICAR QUE FUNCIONA
+================================================================
+
+  1. Con el watcher corriendo, guarda un .dxf en Z:\TRABAJOS_DXF
+  2. Mira Z:\TRABAJOS_DXF — debe aparecer el .pdf al lado en pocos segundos
+  3. Si Trello está activo, mira la tarjeta — debe tener el PDF adjunto
+
+  Log detallado en: dxf_watcher.log (en esta misma carpeta)
+
+================================================================
+  PROBLEMAS COMUNES
+================================================================
+
+"No detecta los DXF"
+  - Verifica watch_folder en watcher_config.json
+  - Comprueba que la unidad de red (Z:) está conectada
+
+"No sube a Trello"
+  - Revisa api_key y token en watcher_config.json
+  - El nombre del DXF debe empezar por el número de tarjeta (ej T7060_...)
+
+"Error generando PDF"
+  - Revisa dxf_watcher.log para ver el mensaje exacto
+
+================================================================
+  NOTAS
+================================================================
+
+- La PRIMERA instalación descarga Python desde python.org (~30MB).
+  Necesita conexión a internet SOLO esa primera vez.
+- Las instalaciones posteriores ya no bajan nada.
+- El watcher consume muy pocos recursos — puede quedar abierto 24/7.
+
+Si algo va mal, copia el contenido de dxf_watcher.log y pásalo al que
+te haya dado el programa.

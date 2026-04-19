@@ -223,7 +223,7 @@ SOLO JSON válido, sin prosa alrededor, sin bloques ```:
 {
   "piezas": [
     {
-      "tipo": "encimera|chapeado|copete|rodapie|isla|costado|pilastra|paso|tabica|zocalo|otro",
+      "tipo": "encimera|chapeado|copete|rodapie|isla|costado|pilastra|paso|tabica|zocalo|gama|dintel|antepecho|otro",
       "forma": "rectangular|L|U|irregular",
       "largo_mm": ...,
       "ancho_mm": ...,
@@ -455,8 +455,15 @@ Reglas:
   que el operario pueda añadirla luego a reglas_negocio.md.
 - Sigue todas las demás reglas del system prompt base y del archivo de reglas.
 
-Formato: MISMO JSON que sintetizar_piezas (piezas + razonamiento_global +
-anotaciones_contextuales_ids). SOLO JSON, sin prosa fuera.
+Formato: MISMO JSON que sintetizar_piezas, DEVUELVE TODOS LOS CAMPOS top-level:
+  - piezas (array completa, no solo las cambiadas)
+  - razonamiento_global (con línea al final indicando qué se cambió en este refinamiento)
+  - anotaciones_contextuales_ids
+  - cliente, numero, material
+  - **grosor_mm** (IMPORTANTE: si el usuario o el razonamiento menciona grosor del
+    material, emítelo al top-level; no omitas este campo)
+
+SOLO JSON, sin prosa fuera.
 """
 
 

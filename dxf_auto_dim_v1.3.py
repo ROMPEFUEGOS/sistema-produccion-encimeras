@@ -1012,10 +1012,13 @@ def draw_chain_dims_v(ax, ref_pts, maxx, gap, units, color=COL_CHAIN):
             bbox=dict(boxstyle='round,pad=0.16', fc='white', ec=color, lw=0.6, alpha=0.95))
 
 
-def draw_edge_label(ax, p0, p1, label, color=COL_DIAG, fs=6.0):
+def draw_edge_label(ax, p0, p1, label, color=COL_DIAG, fs=6.0, interior_ref=None):
     """
     Cota de longitud + ángulo sobre una arista diagonal.
-    Flecha paralela al segmento, offset perpendicular al exterior.
+    Flecha paralela al segmento, offset perpendicular.
+
+    interior_ref: (cx,cy) del centroide de la pieza. Si se pasa, el offset
+    se hace HACIA el interior (evita solapes con cotas globales que van afuera).
     """
     dx, dy = p1[0]-p0[0], p1[1]-p0[1]
     length = math.hypot(dx, dy)
@@ -1024,6 +1027,13 @@ def draw_edge_label(ax, p0, p1, label, color=COL_DIAG, fs=6.0):
     # Normal perpendicular (izq del vector de dirección)
     nx, ny = -dy/length, dx/length
     offset = max(8.0, length * 0.05)
+
+    # Si sabemos dónde está el interior, forzar que nx,ny apunte hacia él
+    if interior_ref is not None:
+        mx0, my0 = (p0[0]+p1[0])/2, (p0[1]+p1[1])/2
+        vx, vy = interior_ref[0] - mx0, interior_ref[1] - my0
+        if nx*vx + ny*vy < 0:
+            nx, ny = -nx, -ny
 
     # Puntos del segmento de cota (paralelos al borde, offset hacia afuera)
     a0 = (p0[0]+nx*offset, p0[1]+ny*offset)
@@ -1268,6 +1278,12 @@ def draw_edge_finishes(ax, piece, markers, gap):
     if not markers:
         return
     COLORS = {'inglete': '#C62828', 'bisel': '#6A1B9A', 'pulido': '#00838F'}
+    # Centroide para forzar que la etiqueta vaya DENTRO de la pieza (evita
+    # solapes con cotas exteriores del perímetro)
+    outer = piece['outer']
+    n = len(outer) or 1
+    cx = sum(p[0] for p in outer) / n
+    cy = sum(p[1] for p in outer) / n
     for mk in markers:
         edge = _match_marker_to_edge(mk, piece['outer'])
         if edge is None:
@@ -1279,7 +1295,8 @@ def draw_edge_finishes(ax, piece, markers, gap):
             label = f"BISEL {abs(mk['angle']):.1f}°"
         else:
             label = "PULIDO"
-        draw_edge_label(ax, a, b, label, color=COLORS[mk['kind']], fs=7.2)
+        draw_edge_label(ax, a, b, label, color=COLORS[mk['kind']], fs=7.2,
+                        interior_ref=(cx, cy))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1387,6 +1404,44 @@ def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm'
                               gap, COL_ANGLE)
 
     # ── COTAS DE HUECOS ───────────────────────────────────────────────────────
+    # Pre-análisis: identificar qué hueco es el leftmost/rightmost en cada "fila"
+    # horizontal (misma Y aproximada), y topmost/bottommost en cada "columna"
+    # vertical, para evitar cotas que cruzan otros huecos.
+    tol_y = (m['maxy'] - m['miny']) * 0.30
+    tol_x = (m['maxx'] - m['minx']) * 0.30
+
+    def _is_leftmost(i):
+        h = m['holes'][i]
+        for j, h2 in enumerate(m['holes']):
+            if j == i: continue
+            if abs(h2['cy'] - h['cy']) < tol_y and h2['cx'] < h['cx']:
+                return False
+        return True
+
+    def _is_rightmost(i):
+        h = m['holes'][i]
+        for j, h2 in enumerate(m['holes']):
+            if j == i: continue
+            if abs(h2['cy'] - h['cy']) < tol_y and h2['cx'] > h['cx']:
+                return False
+        return True
+
+    def _is_bottommost(i):
+        h = m['holes'][i]
+        for j, h2 in enumerate(m['holes']):
+            if j == i: continue
+            if abs(h2['cx'] - h['cx']) < tol_x and h2['cy'] < h['cy']:
+                return False
+        return True
+
+    def _is_topmost(i):
+        h = m['holes'][i]
+        for j, h2 in enumerate(m['holes']):
+            if j == i: continue
+            if abs(h2['cx'] - h['cx']) < tol_x and h2['cy'] > h['cy']:
+                return False
+        return True
+
     for idx, hd in enumerate(m['holes']):
         hcx, hcy = hd['cx'], hd['cy']
         hw, hh2  = hd['width'], hd['height']
@@ -1405,23 +1460,24 @@ def render_piece_page(piece, m, pdf, dxf_name, page_num, total_pages, units='mm'
             dim_v(ax, hcy-hh2/2, hcy+hh2/2, hcx+hw/2,
                   f"{hh2:.2f}", dx=gs, color=COL_HOLE, fs=6.5)
 
-        # ── Posición del hueco: las 4 distancias a bordes ─────────────────
+        # ── Posición del hueco: distancias a bordes (solo relevantes) ────
         gs2 = gs * 0.65
 
-        # Izquierda
-        if hd['dist_left'] > 1.0:
+        # Solo dibujar dist_left si este hueco es el MÁS A LA IZQUIERDA de su fila
+        # (evita que la cota cruce otros huecos hacia la izquierda)
+        if hd['dist_left'] > 1.0 and _is_leftmost(idx):
             dim_h(ax, m['minx'], hcx-hw/2, hcy,
                   f"{hd['dist_left']:.2f}", dy=gs2, color=COL_DIST, fs=6)
-        # Derecha
-        if hd['dist_right'] > 1.0:
+        # dist_right solo si es el más a la derecha de su fila
+        if hd['dist_right'] > 1.0 and _is_rightmost(idx):
             dim_h(ax, hcx+hw/2, m['maxx'], hcy,
                   f"{hd['dist_right']:.2f}", dy=gs2, color=COL_DIST, fs=6)
-        # Inferior
-        if hd['dist_bottom'] > 1.0:
+        # dist_bottom solo si es el más abajo de su columna
+        if hd['dist_bottom'] > 1.0 and _is_bottommost(idx):
             dim_v(ax, m['miny'], hcy-hh2/2, hcx-hw/2,
                   f"{hd['dist_bottom']:.2f}", dx=-gs2, color=COL_DIST, fs=6)
-        # Superior
-        if hd['dist_top'] > 1.0:
+        # dist_top solo si es el más arriba de su columna
+        if hd['dist_top'] > 1.0 and _is_topmost(idx):
             dim_v(ax, hcy+hh2/2, m['maxy'], hcx-hw/2,
                   f"{hd['dist_top']:.2f}", dx=-gs2, color=COL_DIST, fs=6)
 
