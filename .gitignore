@@ -13,6 +13,10 @@ Fotos Materiales (2)/
 *.bak
 *.dxf~
 
+# Excepciones de documentación permanente
+!docs/libreta_completa_3_variantes_y_ejemplo.pdf
+!CAM_Rules_Manual.docx
+
 # Python
 __pycache__/
 *.pyc

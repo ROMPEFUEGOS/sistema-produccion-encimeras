@@ -1928,9 +1928,23 @@ def render_final_summary_page(datos, pieces_data, pdf, units='mm'):
             elif t == "pulido": n_pulido += 1
 
     txt = []
-    txt.append(f"Cliente: {datos.get('cliente','?')}")
-    txt.append(f"Material: {datos.get('material','?')}")
-    txt.append(f"Número: {datos.get('numero','?')}")
+    txt.append(f"Nº Medida: {datos.get('numero','?')}   Ref. Cliente Final: {datos.get('referencia_cliente_final','?')}")
+    txt.append(f"Fecha medición: {datos.get('fecha_medicion','?')}   Tomó medidas: {datos.get('tomo_medidas','?')}")
+    txt.append("")
+    cf = datos.get('cliente_final') or datos.get('cliente','?')
+    ci = datos.get('cliente_intermedio','?')
+    txt.append(f"Cliente Final:       {cf}    Tlf: {datos.get('tlf_cliente_final','—')}")
+    txt.append(f"Cliente Intermedio:  {ci}    Tlf: {datos.get('tlf_cliente_intermedio','—')}")
+    txt.append(f"Dirección/Ciudad:    {datos.get('direccion','?')}")
+    txt.append("")
+    txt.append(f"Material:            {datos.get('material','?')}   Grosor: {datos.get('grosor_mm','?')}mm")
+    txt.append(f"Acabado superficie:  {datos.get('acabado_superficie','pulido')}")
+    tt = datos.get('tipo_trabajo') or []
+    if isinstance(tt, list):
+        tt_str = ', '.join(tt) if tt else '?'
+    else:
+        tt_str = str(tt)
+    txt.append(f"Tipo de trabajo:     {tt_str}")
     txt.append("")
     txt.append(f"Total piezas: {len(piezas)}")
     for tipo, n in sorted(tipos.items(), key=lambda kv: -kv[1]):

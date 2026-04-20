@@ -1,5 +1,31 @@
 # Reglas del negocio — sintetizador de piezas
 
+## 🗂 Metadatos top-level del JSON (desde libreta/nota)
+
+La libreta impresa (`docs/libreta_completa_3_variantes_y_ejemplo.pdf`) estandariza
+la cabecera de toda medición. Los campos top-level a rellenar en cada síntesis son:
+
+| Campo | Ejemplo | Obligatorio |
+|-------|---------|-------------|
+| `numero` | "J0317" | ✓ |
+| `referencia_cliente_final` | "18422" | si aparece |
+| `cliente_final` | "Fernando García Pérez" | ✓ |
+| `cliente_intermedio` | "Valmi-Vigo" | si aparece |
+| `tlf_cliente_final` | "+34 666 123 456" | si aparece |
+| `tlf_cliente_intermedio` | "+34 986 987 654" | si aparece |
+| `direccion` | "Camiño do Eirado 9 — Belvedere (Vigo)" | ✓ |
+| `fecha_medicion` | "19/04/2026" | si aparece |
+| `tomo_medidas` | "KC" (iniciales) | si aparece |
+| `material` | "Belvedere (granito)" | ✓ |
+| `grosor_mm` | 20 | ✓ |
+| `acabado_superficie` | "pulido" \| "apomazado" \| "abujardado" \| "flameado" \| "envejecido" \| "natural" | default "pulido" |
+| `tipo_trabajo` | `["cocina_encimera", "cocina_isla"]` (array) | si la libreta tiene casillas marcadas |
+
+**Compat legacy**: `cliente` sigue como alias de `cliente_final`.
+
+---
+
+
 Este archivo se inyecta automáticamente en el system prompt del sintetizador cada
 vez que se llama a `/sintetizar` o `/refinar`. Edita libremente en lenguaje natural.
 Cada regla nueva se aplica en la siguiente llamada a Claude — no hace falta reiniciar.

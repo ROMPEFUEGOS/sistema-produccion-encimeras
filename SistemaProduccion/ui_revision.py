@@ -573,9 +573,15 @@ def comparar_ref(numero):
             "anotaciones_contextuales_ids",
             datos.get("anotaciones_contextuales_ids", []))
         # Propagar metadatos top-level si Claude los emitió
-        for campo in ("grosor_mm", "material", "cliente", "numero", "notas_generales"):
-            if resultado.get(campo) not in (None, "", 0):
-                datos[campo] = resultado[campo]
+        for campo in ("grosor_mm", "material", "cliente", "cliente_final",
+                       "cliente_intermedio", "tlf_cliente_final",
+                       "tlf_cliente_intermedio", "direccion",
+                       "referencia_cliente_final", "fecha_medicion",
+                       "tomo_medidas", "acabado_superficie", "tipo_trabajo",
+                       "numero", "notas_generales"):
+            v = resultado.get(campo)
+            if v not in (None, "", 0) and v != []:
+                datos[campo] = v
         import datetime
         datos["ultima_correccion"] = datetime.datetime.now().isoformat(timespec="seconds")
 
@@ -655,9 +661,15 @@ def refinar(numero):
             "anotaciones_contextuales_ids",
             datos.get("anotaciones_contextuales_ids", []))
         # Propagar metadatos top-level si Claude los emitió
-        for campo in ("grosor_mm", "material", "cliente", "numero", "notas_generales"):
-            if resultado.get(campo) not in (None, "", 0):
-                datos[campo] = resultado[campo]
+        for campo in ("grosor_mm", "material", "cliente", "cliente_final",
+                       "cliente_intermedio", "tlf_cliente_final",
+                       "tlf_cliente_intermedio", "direccion",
+                       "referencia_cliente_final", "fecha_medicion",
+                       "tomo_medidas", "acabado_superficie", "tipo_trabajo",
+                       "numero", "notas_generales"):
+            v = resultado.get(campo)
+            if v not in (None, "", 0) and v != []:
+                datos[campo] = v
         import datetime
         datos["ultima_correccion"] = datetime.datetime.now().isoformat(timespec="seconds")
 
@@ -1266,12 +1278,26 @@ function render() {
   // Metadatos de la orden
   const meta = el("div", {class:"meta"});
   [
-    ["cliente", "Cliente"],
-    ["numero", "Número"],
+    ["numero", "Nº Medida"],
+    ["referencia_cliente_final", "Ref. Cliente Final"],
+    ["fecha_medicion", "Fecha"],
+    ["tomo_medidas", "Tomó medidas"],
+    ["cliente_final", "Cliente Final"],
+    ["tlf_cliente_final", "Tlf. C. Final"],
+    ["cliente_intermedio", "Cliente Intermedio"],
+    ["tlf_cliente_intermedio", "Tlf. C. Intermedio"],
+    ["direccion", "Dirección/Ciudad"],
     ["material", "Material"],
+    ["grosor_mm", "Grosor (mm)"],
+    ["acabado_superficie", "Acabado superficie"],
+    ["tipo_trabajo", "Tipo trabajo"],
     ["notas_generales", "Notas"],
   ].forEach(([key, label]) => {
-    const inp = el("input", {type:"text", value: datos[key] || ""});
+    let val = datos[key];
+    // Si el valor es array (ej. tipo_trabajo), lo mostramos como CSV
+    if (Array.isArray(val)) val = val.join(", ");
+    const inp = el("input", {type: (key === "grosor_mm" ? "number" : "text"),
+                              value: val ?? ""});
     inp.dataset.field = key; inp.dataset.target = "meta";
     meta.appendChild(el("label", {}, label));
     meta.appendChild(inp);

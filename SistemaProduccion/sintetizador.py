@@ -256,11 +256,28 @@ SOLO JSON válido, sin prosa alrededor, sin bloques ```:
 Lista las IDs de anotaciones que SON contexto global (símbolos, convenciones,
 correcciones generales) y que por tanto NO corresponden a ninguna pieza concreta.
 
-### ⚠ grosor_mm al top-level
+### ⚠ Metadatos top-level (rellena todos los que aparezcan en la libreta/nota)
 
-Si la nota menciona "granito 20mm", "2cm", "Dekton 12mm", "Neolith 30mm" u otra
-indicación de **grosor del material**, emítelo en `grosor_mm` (número mm) al
-NIVEL SUPERIOR del JSON. NO lo metas en `alto_mm` ni `ancho_mm` de piezas.
+- **numero**: nº de medida (ej "J0317", "T7060", "V0275")
+- **referencia_cliente_final**: nº de pedido externo (ej "18422")
+- **cliente_final**: nombre del cliente final (quien recibe la encimera)
+- **cliente_intermedio**: distribuidor/mueblero (Valmi, Milano, ACyC, Cocimoble…)
+- **tlf_cliente_final** / **tlf_cliente_intermedio**: teléfonos si aparecen
+- **direccion**: dirección + ciudad de la obra
+- **fecha_medicion**: fecha (dd/mm/aaaa o aaaa-mm-dd)
+- **tomo_medidas**: iniciales del operario
+- **material**: nombre ("Belvedere", "Silvestre", "Dekton Entzo"…)
+- **grosor_mm**: grosor del material en mm (20, 12, 30). CRÍTICO: global del
+  pedido. NUNCA lo metas en alto_mm/ancho_mm de piezas.
+- **acabado_superficie**: "pulido" | "apomazado" | "abujardado" | "flameado" |
+  "envejecido" | "natural" (default "pulido" si no se indica)
+- **tipo_trabajo**: array con tags marcados, cualquiera de:
+  `cocina_encimera`, `cocina_encimera_chapeado`, `cocina_isla`,
+  `cocina_reposicion`, `bano_encimera`, `bano_plato_ducha`,
+  `bano_revestimiento`, `recercado_ventana`, `recercado_puerta`,
+  `escalera_peldanos`, `escalera_rodapie`, `revestimiento_fachada`,
+  `lapida_funerario`, `mesa_sobremesa_banco`, `pieza_especial`.
+- **cliente** (legacy, alias de cliente_final): emítelo también por compat.
 
 ### ⚠ Dimensiones por tipo de pieza (importante, evita errores en DXF)
 
